@@ -1,0 +1,13 @@
+# Build artifacts
+/target/
+**/target/
+
+# OS metadata
+.DS_Store
+
+# Local runtime/tool caches
+.magpie/
+.omc/
+.omx/
+.cargo-home/
+.cargo-local/

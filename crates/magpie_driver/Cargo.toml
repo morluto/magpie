@@ -1,0 +1,29 @@
+[package]
+name = "magpie_driver"
+version.workspace = true
+edition.workspace = true
+
+[[test]]
+name = "integration_test"
+path = "../../tests/integration_test.rs"
+
+[dependencies]
+magpie_ast = { path = "../magpie_ast" }
+magpie_lex = { path = "../magpie_lex" }
+magpie_parse = { path = "../magpie_parse" }
+magpie_csnf = { path = "../magpie_csnf" }
+magpie_hir = { path = "../magpie_hir" }
+magpie_sema = { path = "../magpie_sema" }
+magpie_types = { path = "../magpie_types" }
+magpie_mono = { path = "../magpie_mono" }
+magpie_own = { path = "../magpie_own" }
+magpie_mpir = { path = "../magpie_mpir" }
+magpie_arc = { path = "../magpie_arc" }
+magpie_gpu = { path = "../magpie_gpu" }
+magpie_diag = { path = "../magpie_diag" }
+magpie_pkg = { path = "../magpie_pkg" }
+magpie_memory = { path = "../magpie_memory" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+regex = "1"
