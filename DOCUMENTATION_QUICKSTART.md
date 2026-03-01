@@ -938,6 +938,7 @@ Compatibility note:
 - `str.parse_*` is currently exposed in source as value-producing ops for compatibility.
 - Under the hood, runtime ABI calls are now fallible (`mp_rt_str_try_parse_*` / `mp_rt_json_try_*`) with explicit status checks in codegen.
 - Legacy runtime wrappers (`mp_rt_str_parse_*`, `mp_rt_json_encode`, `mp_rt_json_decode`) are deprecated temporary shims and are planned for removal after migration.
+- For runtime FFI users: successful `mp_rt_json_try_decode` returns owned memory in `out_val`; free with `mp_rt_json_decoded_free(out_val, type_id)`.
 
 String opcodes:
 

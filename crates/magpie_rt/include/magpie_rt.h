@@ -170,9 +170,13 @@ uint8_t* mp_rt_json_decode(MpRtHeader* json_str, uint32_t type_id);
  * - Returns MP_RT_OK on success and writes to `out_str` / `out_val`.
  * - On error, returns nonzero status and optionally writes owned Str to `out_errmsg`.
  * - Caller releases `*out_errmsg` via mp_rt_release_strong when non-NULL.
+ * - For `mp_rt_json_try_decode` success, caller owns `*out_val` and MUST release it
+ *   via `mp_rt_json_decoded_free(*out_val, type_id)`.
+ * - `mp_rt_json_decoded_free(NULL, type_id)` is a no-op and returns MP_RT_OK.
  */
 int32_t mp_rt_json_try_encode(uint8_t* obj, uint32_t type_id, MpRtHeader** out_str, MpRtHeader** out_errmsg);
 int32_t mp_rt_json_try_decode(MpRtHeader* json_str, uint32_t type_id, uint8_t** out_val, MpRtHeader** out_errmsg);
+int32_t mp_rt_json_decoded_free(uint8_t* decoded, uint32_t type_id);
 
 MpRtHeader* mp_rt_channel_new(uint32_t elem_type_id, uint64_t elem_size);
 void mp_rt_channel_send(MpRtHeader* sender, const uint8_t* val, uint64_t elem_size);

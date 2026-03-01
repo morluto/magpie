@@ -1838,6 +1838,72 @@ pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u
     out
 }
 
+/// Release a value produced by `mp_rt_json_try_decode` / `mp_rt_json_decode`.
+///
+/// Contract:
+/// - `decoded == NULL` is a no-op and returns `MP_RT_OK`.
+/// - `type_id` must match the decode target type used to produce `decoded`.
+/// - For `TYPE_ID_STR`, this calls `mp_rt_release_strong` on the handle.
+/// - For primitive type_ids, this frees the boxed primitive allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_json_decoded_free(decoded: *mut u8, type_id: u32) -> i32 {
+    if decoded.is_null() {
+        return MP_RT_OK;
+    }
+
+    match type_id {
+        TYPE_ID_BOOL => {
+            drop(Box::from_raw(decoded));
+            MP_RT_OK
+        }
+        TYPE_ID_I8 => {
+            drop(Box::from_raw(decoded as *mut i8));
+            MP_RT_OK
+        }
+        TYPE_ID_I16 => {
+            drop(Box::from_raw(decoded as *mut i16));
+            MP_RT_OK
+        }
+        TYPE_ID_I32 => {
+            drop(Box::from_raw(decoded as *mut i32));
+            MP_RT_OK
+        }
+        TYPE_ID_I64 => {
+            drop(Box::from_raw(decoded as *mut i64));
+            MP_RT_OK
+        }
+        TYPE_ID_U8 => {
+            drop(Box::from_raw(decoded));
+            MP_RT_OK
+        }
+        TYPE_ID_U16 => {
+            drop(Box::from_raw(decoded as *mut u16));
+            MP_RT_OK
+        }
+        TYPE_ID_U32 => {
+            drop(Box::from_raw(decoded as *mut u32));
+            MP_RT_OK
+        }
+        TYPE_ID_U64 => {
+            drop(Box::from_raw(decoded as *mut u64));
+            MP_RT_OK
+        }
+        TYPE_ID_F32 => {
+            drop(Box::from_raw(decoded as *mut f32));
+            MP_RT_OK
+        }
+        TYPE_ID_F64 => {
+            drop(Box::from_raw(decoded as *mut f64));
+            MP_RT_OK
+        }
+        TYPE_ID_STR => {
+            mp_rt_release_strong(decoded as *mut MpRtHeader);
+            MP_RT_OK
+        }
+        _ => MP_RT_ERR_UNSUPPORTED_TYPE,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime support: channels / web bridge / GPU CPU-fallback bridge
 // ---------------------------------------------------------------------------
@@ -2049,24 +2115,38 @@ const TYPE_ID_GPU_BUFFER_RT: u32 = 31;
 const TYPE_ID_GPU_FENCE_RT: u32 = 32;
 const TYPE_ID_GPU_KERNEL_RT: u32 = 50;
 const TYPE_ID_GPU_ERROR: u32 = 33;
+// Reserved by the GPU interop ABI; not all are materialized yet in runtime code paths.
+#[allow(dead_code)]
 const TYPE_ID_GPU_ERROR_KIND: u32 = 34;
 const TYPE_ID_GPU_PROFILE_SESSION: u32 = 35;
 const TYPE_ID_GPU_PROFILE_EVENT: u32 = 36;
 const TYPE_ID_GPU_MEMORY_STATS: u32 = 37;
+#[allow(dead_code)]
 const TYPE_ID_MLX_ARRAY: u32 = 38;
+#[allow(dead_code)]
 const TYPE_ID_MLX_LAYER_HANDLE: u32 = 39;
+#[allow(dead_code)]
 const TYPE_ID_MLX_OPTIMIZER_HANDLE: u32 = 40;
 
+// Reserved GPU error code space from the interop ABI.
+#[allow(dead_code)]
 const GPU_ERROR_DEVICE_LOST: i32 = 0;
+#[allow(dead_code)]
 const GPU_ERROR_OUT_OF_MEMORY: i32 = 1;
+#[allow(dead_code)]
 const GPU_ERROR_LAUNCH_FAILED: i32 = 2;
+#[allow(dead_code)]
 const GPU_ERROR_INVALID_KERNEL: i32 = 3;
 const GPU_ERROR_BACKEND_UNAVAILABLE: i32 = 4;
+#[allow(dead_code)]
 const GPU_ERROR_BUFFER_ERROR: i32 = 5;
+#[allow(dead_code)]
 const GPU_ERROR_TIMEOUT_EXPIRED: i32 = 6;
 const GPU_ERROR_UNSUPPORTED: i32 = 7;
+#[allow(dead_code)]
 const GPU_ERROR_COMPILATION_FAILED: i32 = 8;
 const GPU_ERROR_DRIVER_ERROR: i32 = 9;
+#[allow(dead_code)]
 const GPU_ERROR_RESOURCE_EXHAUSTED: i32 = 10;
 const GPU_ERROR_VALIDATION_FAILED: i32 = 11;
 
@@ -2112,7 +2192,7 @@ struct MpRtGpuParam {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct MpRtGpuKernelEntry {
+pub struct MpRtGpuKernelEntry {
     sid_hash: u64,
     num_blobs: u32,
     _reserved: u32,
@@ -5199,6 +5279,55 @@ mod tests {
     }
 
     #[test]
+    fn test_json_try_decode_value_free_contract() {
+        unsafe {
+            let json_i32 = make_str("-7");
+            let mut out_i32: *mut u8 = std::ptr::null_mut();
+            let mut out_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_json_try_decode(json_i32, TYPE_ID_I32, &mut out_i32, &mut out_err),
+                MP_RT_OK
+            );
+            assert!(out_err.is_null());
+            assert!(!out_i32.is_null());
+            assert_eq!(*(out_i32 as *const i32), -7);
+            assert_eq!(mp_rt_json_decoded_free(out_i32, TYPE_ID_I32), MP_RT_OK);
+
+            let json_str = make_str("\"hello\"");
+            let mut out_str: *mut u8 = std::ptr::null_mut();
+            out_err = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_json_try_decode(json_str, TYPE_ID_STR, &mut out_str, &mut out_err),
+                MP_RT_OK
+            );
+            assert!(out_err.is_null());
+            assert!(!out_str.is_null());
+            assert_eq!(read_str(out_str as *mut MpRtHeader), "hello");
+            assert_eq!(mp_rt_json_decoded_free(out_str, TYPE_ID_STR), MP_RT_OK);
+
+            mp_rt_release_strong(json_i32);
+            mp_rt_release_strong(json_str);
+        }
+    }
+
+    #[test]
+    fn test_json_decoded_free_null_and_unsupported_type() {
+        unsafe {
+            assert_eq!(
+                mp_rt_json_decoded_free(std::ptr::null_mut(), TYPE_ID_I64),
+                MP_RT_OK
+            );
+
+            let raw = Box::into_raw(Box::new(42_i32)) as *mut u8;
+            assert_eq!(
+                mp_rt_json_decoded_free(raw, 0xFFFF_FFFF),
+                MP_RT_ERR_UNSUPPORTED_TYPE
+            );
+            drop(Box::from_raw(raw as *mut i32));
+        }
+    }
+
+    #[test]
     fn test_future_poll_take() {
         unsafe {
             let state = Box::into_raw(Box::new(MpRtFutureState {
@@ -5294,6 +5423,7 @@ mod tests {
         assert!(header.contains("mp_rt_str_try_parse_bool("));
         assert!(header.contains("mp_rt_json_try_encode("));
         assert!(header.contains("mp_rt_json_try_decode("));
+        assert!(header.contains("mp_rt_json_decoded_free("));
     }
 }
 

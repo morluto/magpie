@@ -5,7 +5,7 @@ use magpie_mpir::{
     HirConst, HirConstLit, MpirBlock, MpirFn, MpirInstr, MpirModule, MpirOp, MpirOpVoid,
     MpirTerminator, MpirValue,
 };
-use magpie_types::{fixed_type_ids, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
+use magpie_types::{fixed_type_ids, HandleKind, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -194,6 +194,7 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare i32 @mp_rt_bytes_cmp(ptr, ptr, i64)",
             "declare i32 @mp_rt_json_try_encode(ptr, i32, ptr, ptr)",
             "declare i32 @mp_rt_json_try_decode(ptr, i32, ptr, ptr)",
+            "declare i32 @mp_rt_json_decoded_free(ptr, i32)",
             "declare i32 @mp_rt_str_try_parse_i64(ptr, ptr, ptr)",
             "declare i32 @mp_rt_str_try_parse_u64(ptr, ptr, ptr)",
             "declare i32 @mp_rt_str_try_parse_f64(ptr, ptr, ptr)",
@@ -698,6 +699,14 @@ struct Operand {
     repr: String,
 }
 
+#[derive(Clone, Copy)]
+enum ArcAction {
+    RetainStrong,
+    ReleaseStrong,
+    RetainWeak,
+    ReleaseWeak,
+}
+
 struct FnBuilder<'a> {
     cg: &'a LlvmTextCodegen<'a>,
     f: &'a MpirFn,
@@ -705,6 +714,7 @@ struct FnBuilder<'a> {
     tmp_idx: u32,
     locals: HashMap<u32, Operand>,
     local_tys: HashMap<u32, TypeId>,
+    json_decode_owned: HashMap<u32, u32>,
 }
 
 impl<'a> FnBuilder<'a> {
@@ -758,6 +768,7 @@ impl<'a> FnBuilder<'a> {
             tmp_idx: 0,
             locals,
             local_tys,
+            json_decode_owned: HashMap::new(),
         })
     }
 
@@ -819,8 +830,7 @@ impl<'a> FnBuilder<'a> {
             | MpirOp::CloneWeak { v }
             | MpirOp::WeakDowngrade { v }
             | MpirOp::WeakUpgrade { v } => {
-                let op = self.value(v)?;
-                self.assign_or_copy(i.dst, i.ty, op)?;
+                self.assign_or_copy_value(i.dst, i.ty, v)?;
             }
             MpirOp::New { ty, fields } => {
                 self.emit_new_struct(i.dst, i.ty, *ty, fields)?;
@@ -1033,13 +1043,33 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::Phi { incomings, .. } => {
                 let mut parts = Vec::with_capacity(incomings.len());
+                let mut phi_decode_owned: Option<u32> = None;
+                let mut phi_decode_consistent = true;
                 for (bb, v) in incomings {
                     let op = self.value(v)?;
                     parts.push(format!("[ {}, %bb{} ]", op.repr, bb.0));
+                    let incoming_decode = match v {
+                        MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                        _ => None,
+                    };
+                    if let Some(existing) = phi_decode_owned {
+                        if incoming_decode != Some(existing) {
+                            phi_decode_consistent = false;
+                        }
+                    } else if let Some(tid) = incoming_decode {
+                        phi_decode_owned = Some(tid);
+                    } else {
+                        phi_decode_consistent = false;
+                    }
                 }
                 writeln!(self.out, "  {dst} = phi {dst_ty} {}", parts.join(", "))
                     .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
+                if phi_decode_consistent {
+                    if let Some(tid) = phi_decode_owned {
+                        self.json_decode_owned.insert(i.dst.0, tid);
+                    }
+                }
             }
             MpirOp::EnumNew { variant, args } => {
                 self.emit_enum_new(i.dst, i.ty, variant, args)?;
@@ -1055,45 +1085,76 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::ArcRetain { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_retain_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::RetainStrong, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
-                        .map_err(|e| e.to_string())?;
+                    if decoded_ty.is_none() {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
             }
             MpirOp::ArcRelease { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_release_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::ReleaseStrong, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                    if let Some(type_id) = decoded_ty {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(
+                            self.out,
+                            "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
+                        )
                         .map_err(|e| e.to_string())?;
+                    } else {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::ArcRetainWeak { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_retain_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::RetainWeak, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
-                        .map_err(|e| e.to_string())?;
+                    if decoded_ty.is_none() {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
             }
             MpirOp::ArcReleaseWeak { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_release_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::ReleaseWeak, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
-                        .map_err(|e| e.to_string())?;
+                    if decoded_ty.is_none() {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
                 self.set_default(i.dst, i.ty)?;
             }
@@ -1713,7 +1774,7 @@ impl<'a> FnBuilder<'a> {
                 }
             }
             MpirOp::JsonEncode { ty, v } => {
-                let v = self.ensure_ptr_value(v)?;
+                let v = self.ensure_addressable_value(v, *ty)?;
                 let out_slot = self.tmp();
                 writeln!(self.out, "  {out_slot} = alloca ptr").map_err(|e| e.to_string())?;
                 writeln!(self.out, "  store ptr null, ptr {out_slot}")
@@ -1787,6 +1848,7 @@ impl<'a> FnBuilder<'a> {
                     writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
                         .map_err(|e| e.to_string())?;
                     self.assign_gpu_launch_result(i.dst, i.ty, status, Some(decoded), err)?;
+                    self.json_decode_owned.insert(i.dst.0, ty.0);
                 } else {
                     let ok = self.tmp();
                     writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
@@ -1810,6 +1872,7 @@ impl<'a> FnBuilder<'a> {
                     writeln!(self.out, "  {decoded} = load ptr, ptr {out_slot}")
                         .map_err(|e| e.to_string())?;
                     self.set_local(i.dst, i.ty, dst_ty, decoded);
+                    self.json_decode_owned.insert(i.dst.0, ty.0);
                 }
             }
             MpirOp::GpuThreadId { dim }
@@ -2051,42 +2114,76 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOpVoid::ArcRetain { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_retain_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::RetainStrong, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
-                        .map_err(|e| e.to_string())?;
+                    if decoded_ty.is_none() {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             MpirOpVoid::ArcRelease { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_release_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::ReleaseStrong, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                    if let Some(type_id) = decoded_ty {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(
+                            self.out,
+                            "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
+                        )
                         .map_err(|e| e.to_string())?;
+                    } else {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                if let MpirValue::Local(id) = v {
+                    self.json_decode_owned.remove(&id.0);
                 }
             }
             MpirOpVoid::ArcRetainWeak { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_retain_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::RetainWeak, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
-                        .map_err(|e| e.to_string())?;
+                    if decoded_ty.is_none() {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             MpirOpVoid::ArcReleaseWeak { v } => {
                 let op = self.value(v)?;
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_release_composite(&op)?;
+                    self.emit_arc_action(&op, ArcAction::ReleaseWeak, decoded_ty)?;
                 } else {
-                    let p = self.ensure_ptr(op)?;
-                    writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
-                        .map_err(|e| e.to_string())?;
+                    if decoded_ty.is_none() {
+                        let p = self.ensure_ptr(op)?;
+                        writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
         }
@@ -3793,6 +3890,7 @@ impl<'a> FnBuilder<'a> {
                 repr: dst_name,
             },
         );
+        self.json_decode_owned.remove(&dst_id.0);
         Ok(())
     }
 
@@ -3803,11 +3901,21 @@ impl<'a> FnBuilder<'a> {
         v: &MpirValue,
     ) -> Result<(), String> {
         let src = self.value(v)?;
-        self.assign_or_copy(dst_id, dst_ty, src)
+        self.assign_or_copy(dst_id, dst_ty, src)?;
+        match v {
+            MpirValue::Local(src_id) => {
+                if let Some(type_id) = self.json_decode_owned.get(&src_id.0).copied() {
+                    self.json_decode_owned.insert(dst_id.0, type_id);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn set_local(&mut self, id: magpie_types::LocalId, ty_id: TypeId, ty: String, repr: String) {
         self.locals.insert(id.0, Operand { ty, ty_id, repr });
+        self.json_decode_owned.remove(&id.0);
     }
 
     fn set_default(&mut self, id: magpie_types::LocalId, ty_id: TypeId) -> Result<(), String> {
@@ -3821,6 +3929,7 @@ impl<'a> FnBuilder<'a> {
                     repr: "0".to_string(),
                 },
             );
+            self.json_decode_owned.remove(&id.0);
             return Ok(());
         }
         self.locals.insert(
@@ -3831,6 +3940,7 @@ impl<'a> FnBuilder<'a> {
                 repr: self.zero_lit(&ty),
             },
         );
+        self.json_decode_owned.remove(&id.0);
         Ok(())
     }
 
@@ -4084,7 +4194,7 @@ impl<'a> FnBuilder<'a> {
         }
         // Aggregate types (structs like TResult/TOption) cannot be bitcast to ptr.
         // Return null as a sentinel — callers that handle aggregates should use
-        // emit_arc_release_composite / emit_arc_retain_composite instead.
+        // emit_arc_action instead.
         if op.ty.starts_with('{') || op.ty.starts_with('[') || op.ty.starts_with('<') {
             writeln!(self.out, "  ; skip bitcast of aggregate {} to ptr", op.ty)
                 .map_err(|e| e.to_string())?;
@@ -4095,41 +4205,123 @@ impl<'a> FnBuilder<'a> {
         Ok(tmp)
     }
 
-    /// Extract all `ptr`-typed fields from an aggregate value and emit
-    /// `mp_rt_release_strong` for each.  Inactive variant fields are `null`;
-    /// the runtime null-guard handles them safely.
-    fn emit_arc_release_composite(&mut self, op: &Operand) -> Result<(), String> {
-        for (idx, field_ty) in parse_aggregate_fields(&op.ty).iter().enumerate() {
-            if field_ty == "ptr" {
-                let tmp = self.tmp();
-                writeln!(
-                    self.out,
-                    "  {tmp} = extractvalue {} {}, {idx}",
-                    op.ty, op.repr
-                )
-                .map_err(|e| e.to_string())?;
-                writeln!(self.out, "  call void @mp_rt_release_strong(ptr {tmp})")
-                    .map_err(|e| e.to_string())?;
+    fn emit_arc_action_call(&mut self, p: &str, action: ArcAction) -> Result<(), String> {
+        match action {
+            ArcAction::RetainStrong => {
+                writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
+                    .map_err(|e| e.to_string())
+            }
+            ArcAction::ReleaseStrong => {
+                writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                    .map_err(|e| e.to_string())
+            }
+            ArcAction::RetainWeak => writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                .map_err(|e| e.to_string()),
+            ArcAction::ReleaseWeak => {
+                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                    .map_err(|e| e.to_string())
             }
         }
-        Ok(())
     }
 
-    /// Extract all `ptr`-typed fields from an aggregate value and emit
-    /// `mp_rt_retain_strong` for each.
-    fn emit_arc_retain_composite(&mut self, op: &Operand) -> Result<(), String> {
-        for (idx, field_ty) in parse_aggregate_fields(&op.ty).iter().enumerate() {
-            if field_ty == "ptr" {
-                let tmp = self.tmp();
-                writeln!(
-                    self.out,
-                    "  {tmp} = extractvalue {} {}, {idx}",
-                    op.ty, op.repr
-                )
-                .map_err(|e| e.to_string())?;
-                writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {tmp})")
-                    .map_err(|e| e.to_string())?;
+    fn extract_aggregate_field(
+        &mut self,
+        parent: &Operand,
+        idx: usize,
+        field_ty_id: TypeId,
+        field_ty: String,
+    ) -> Result<Operand, String> {
+        let tmp = self.tmp();
+        writeln!(
+            self.out,
+            "  {tmp} = extractvalue {} {}, {idx}",
+            parent.ty, parent.repr
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Operand {
+            ty: field_ty,
+            ty_id: field_ty_id,
+            repr: tmp,
+        })
+    }
+
+    fn emit_arc_action(
+        &mut self,
+        op: &Operand,
+        action: ArcAction,
+        decode_owned_type: Option<u32>,
+    ) -> Result<(), String> {
+        match self.cg.kind_of(op.ty_id) {
+            Some(TypeKind::HeapHandle {
+                hk: HandleKind::Unique | HandleKind::Shared,
+                ..
+            }) => {
+                if matches!(action, ArcAction::RetainStrong | ArcAction::ReleaseStrong) {
+                    let p = self.ensure_ptr(op.clone())?;
+                    self.emit_arc_action_call(&p, action)?;
+                }
             }
+            Some(TypeKind::HeapHandle {
+                hk: HandleKind::Weak,
+                ..
+            }) => {
+                if matches!(action, ArcAction::RetainWeak | ArcAction::ReleaseWeak) {
+                    let p = self.ensure_ptr(op.clone())?;
+                    self.emit_arc_action_call(&p, action)?;
+                }
+            }
+            Some(TypeKind::HeapHandle {
+                hk: HandleKind::Borrow | HandleKind::MutBorrow,
+                ..
+            }) => {}
+            Some(TypeKind::BuiltinOption { inner }) => {
+                let inner_op = self.extract_aggregate_field(
+                    op,
+                    0,
+                    *inner,
+                    self.cg.llvm_storage_ty(*inner),
+                )?;
+                self.emit_arc_action(&inner_op, action, None)?;
+            }
+            Some(TypeKind::BuiltinResult { ok, err }) => {
+                let ok_is_rawptr = matches!(self.cg.kind_of(*ok), Some(TypeKind::RawPtr { .. }));
+                if matches!(action, ArcAction::ReleaseStrong) && ok_is_rawptr {
+                    if let Some(type_id) = decode_owned_type {
+                        let ok_ptr = self.tmp();
+                        writeln!(
+                            self.out,
+                            "  {ok_ptr} = extractvalue {} {}, 1",
+                            op.ty, op.repr
+                        )
+                        .map_err(|e| e.to_string())?;
+                        writeln!(
+                            self.out,
+                            "  call i32 @mp_rt_json_decoded_free(ptr {ok_ptr}, i32 {type_id})"
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                } else {
+                    let ok_op =
+                        self.extract_aggregate_field(op, 1, *ok, self.cg.llvm_storage_ty(*ok))?;
+                    self.emit_arc_action(&ok_op, action, None)?;
+                }
+                let err_op =
+                    self.extract_aggregate_field(op, 2, *err, self.cg.llvm_storage_ty(*err))?;
+                self.emit_arc_action(&err_op, action, None)?;
+            }
+            Some(TypeKind::Tuple { elems }) => {
+                for (idx, elem) in elems.iter().enumerate() {
+                    let field =
+                        self.extract_aggregate_field(op, idx, *elem, self.cg.llvm_ty(*elem))?;
+                    self.emit_arc_action(&field, action, None)?;
+                }
+            }
+            Some(TypeKind::Prim(_))
+            | Some(TypeKind::RawPtr { .. })
+            | Some(TypeKind::Arr { .. })
+            | Some(TypeKind::Vec { .. })
+            | Some(TypeKind::ValueStruct { .. })
+            | None => {}
         }
         Ok(())
     }
@@ -4160,6 +4352,31 @@ impl<'a> FnBuilder<'a> {
     fn ensure_ptr_value(&mut self, v: &MpirValue) -> Result<String, String> {
         let op = self.value(v)?;
         self.ensure_ptr(op)
+    }
+
+    fn ensure_addressable_value(
+        &mut self,
+        v: &MpirValue,
+        expected_ty: TypeId,
+    ) -> Result<String, String> {
+        let op = self.value(v)?;
+        if op.ty == "ptr" {
+            return Ok(op.repr);
+        }
+
+        let expected = self.cg.llvm_storage_ty(expected_ty);
+        if op.ty != expected {
+            return Err(format!(
+                "cannot pass {} value to json.encode expecting {}",
+                op.ty, expected
+            ));
+        }
+
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {expected}").map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store {expected} {}, ptr {slot}", op.repr)
+            .map_err(|e| e.to_string())?;
+        Ok(slot)
     }
 
     fn tmp(&mut self) -> String {
@@ -4298,20 +4515,6 @@ fn normalize_icmp_pred(pred: &str) -> &str {
         "le" => "sle",
         _ => "eq",
     }
-}
-
-/// Parse the field types of an LLVM aggregate type like `{ i1, i64, ptr }`.
-/// Returns a vec of the field type strings (e.g. `["i1", "i64", "ptr"]`).
-fn parse_aggregate_fields(ty: &str) -> Vec<String> {
-    let trimmed = ty.trim();
-    let inner = match trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        Some(s) => s,
-        None => return vec![],
-    };
-    if inner.trim().is_empty() {
-        return vec![];
-    }
-    inner.split(',').map(|f| f.trim().to_string()).collect()
 }
 
 fn normalize_fcmp_pred(pred: &str) -> &str {
@@ -5376,6 +5579,7 @@ mod tests {
         assert!(llvm_ir.contains("declare i32 @mp_rt_str_try_parse_i64(ptr, ptr, ptr)"));
         assert!(llvm_ir.contains("declare i32 @mp_rt_json_try_encode(ptr, i32, ptr, ptr)"));
         assert!(llvm_ir.contains("declare i32 @mp_rt_json_try_decode(ptr, i32, ptr, ptr)"));
+        assert!(llvm_ir.contains("declare i32 @mp_rt_json_decoded_free(ptr, i32)"));
         assert!(llvm_ir.contains("call i32 @mp_rt_str_try_parse_i64"));
         assert!(llvm_ir.contains("call i32 @mp_rt_json_try_encode"));
         assert!(llvm_ir.contains("call i32 @mp_rt_json_try_decode"));
@@ -5554,6 +5758,192 @@ mod tests {
         assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr } undef, i1 1, 0"));
         assert!(!llvm_ir.contains("json_decode_panic"));
         assert!(!llvm_ir.contains("call void @mp_rt_panic"));
+    }
+
+    #[test]
+    fn test_codegen_json_encode_i32_passes_stack_address_not_inttoptr_value() {
+        let type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+
+        let module = MpirModule {
+            sid: Sid("M:JSONENCADDR".to_string()),
+            path: "json_encode_addr.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONENCADDR".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(7),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: str_ty,
+                            op: MpirOp::JsonEncode {
+                                ty: fixed_type_ids::I32,
+                                v: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        2,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: i32_ty,
+                        name: "v".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: str_ty,
+                        name: "json".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("call i32 @mp_rt_json_try_encode"));
+        assert!(llvm_ir.contains("alloca i32"));
+        assert!(llvm_ir.contains("store i32 7, ptr"));
+        assert!(
+            !llvm_ir.contains("inttoptr i32"),
+            "json.encode primitive lowering must not cast scalar values to addresses"
+        );
+    }
+
+    #[test]
+    fn test_codegen_arc_release_result_with_rawptr_only_releases_err_handle() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONARCREL".to_string()),
+            path: "json_arc_release.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONARCREL".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: decode_result_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        3,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "r".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: decode_result_ty,
+                        name: "released".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("call i32 @mp_rt_json_try_decode"));
+        assert!(llvm_ir.contains("extractvalue { i1, ptr, ptr } %l1, 2"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_json_decoded_free"));
+        let strong_release_calls = llvm_ir.matches("call void @mp_rt_release_strong").count();
+        assert_eq!(
+            strong_release_calls, 1,
+            "only the Err(Str) payload should be strongly released"
+        );
+        assert!(
+            !llvm_ir.contains("extractvalue { i1, ptr, ptr } %l1, 1\n  call void @mp_rt_release_strong"),
+            "rawptr payload in TResult<rawptr<u8>, Str> must not be retained/released as heap handle"
+        );
     }
 
     #[test]
