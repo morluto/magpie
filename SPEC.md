@@ -2306,6 +2306,7 @@ int32_t mp_rt_str_try_parse_f64(MpRtHeader* s, double* out, MpRtHeader** out_err
 int32_t mp_rt_str_try_parse_bool(MpRtHeader* s, int32_t* out, MpRtHeader** out_errmsg);
 int32_t mp_rt_json_try_encode(uint8_t* obj, uint32_t type_id, MpRtHeader** out_str, MpRtHeader** out_errmsg);
 int32_t mp_rt_json_try_decode(MpRtHeader* json_str, uint32_t type_id, uint8_t** out_val, MpRtHeader** out_errmsg);
+int32_t mp_rt_json_decoded_free(uint8_t* decoded, uint32_t type_id);
 ```
 
 Error ownership contract:
@@ -2313,6 +2314,8 @@ Error ownership contract:
 * On success: `status == MP_RT_OK` and `*out_errmsg == NULL` (when `out_errmsg` is non-NULL).
 * On error: runtime MAY allocate an error `Str` and store it in `*out_errmsg`; caller owns it and MUST release via `mp_rt_release_strong`.
 * If `out_errmsg == NULL`, runtime MUST still return status and drop any temporary error string internally.
+* On `mp_rt_json_try_decode` success: caller owns `*out_val` and MUST release it via `mp_rt_json_decoded_free(*out_val, type_id)`.
+* `mp_rt_json_decoded_free(NULL, type_id)` is a no-op and MUST return `MP_RT_OK`.
 * Legacy panic-oriented entry points (`mp_rt_str_parse_*`, `mp_rt_json_encode`, `mp_rt_json_decode`) remain as compatibility wrappers over `*_try_*`.
 
 #### 20.1.3 `MpRtTypeInfo` struct

@@ -28,7 +28,7 @@ impl SpvEmitter {
     }
 
     /// Emit SPIR-V binary from an MPIR kernel function.
-    pub fn emit_kernel(&self, kernel: &MpirFn, type_ctx: &TypeCtx) -> Result<Vec<u8>, String> {
+    pub fn emit_kernel(&self, kernel: &MpirFn, _type_ctx: &TypeCtx) -> Result<Vec<u8>, String> {
         // Delegate to existing magpie_gpu::generate_spirv
         Ok(magpie_gpu::generate_spirv(kernel))
     }

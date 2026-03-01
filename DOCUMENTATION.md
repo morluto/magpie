@@ -418,6 +418,7 @@ Runtime ABI note (current migration model):
 - Compiler lowering uses fallible runtime calls (`mp_rt_str_try_parse_*`, `mp_rt_json_try_*`) and checks status codes.
 - In the temporary compatibility path, non-OK status still routes to `mp_rt_panic` to preserve legacy user-visible behavior.
 - Legacy runtime wrappers (`mp_rt_str_parse_*`, `mp_rt_json_encode/decode`) are compatibility shims and are deprecated. New integrations should call only `*_try_*` APIs.
+- Ownership contract: successful `mp_rt_json_try_decode` returns an owned `out_val`; release it with `mp_rt_json_decoded_free(out_val, type_id)`.
 
 ### GPU values
 - `gpu.thread_id`, `gpu.workgroup_id`, `gpu.workgroup_size`, `gpu.global_id`
