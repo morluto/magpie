@@ -5,7 +5,9 @@ use magpie_mpir::{
     HirConst, HirConstLit, MpirBlock, MpirFn, MpirInstr, MpirModule, MpirOp, MpirOpVoid,
     MpirTerminator, MpirValue,
 };
-use magpie_types::{fixed_type_ids, HandleKind, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
+use magpie_types::{
+    fixed_type_ids, HandleKind, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -4275,12 +4277,8 @@ impl<'a> FnBuilder<'a> {
                 ..
             }) => {}
             Some(TypeKind::BuiltinOption { inner }) => {
-                let inner_op = self.extract_aggregate_field(
-                    op,
-                    0,
-                    *inner,
-                    self.cg.llvm_storage_ty(*inner),
-                )?;
+                let inner_op =
+                    self.extract_aggregate_field(op, 0, *inner, self.cg.llvm_storage_ty(*inner))?;
                 self.emit_arc_action(&inner_op, action, None)?;
             }
             Some(TypeKind::BuiltinResult { ok, err }) => {
