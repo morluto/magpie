@@ -615,7 +615,7 @@ pub fn lower_to_hir(
             AstDecl::Fn(f) => (f, false, false),
             AstDecl::AsyncFn(f) => (f, true, false),
             AstDecl::UnsafeFn(f) => (f, false, true),
-            AstDecl::GpuFn(g) => (&g.inner, false, false),
+            AstDecl::GpuFn(g) => (&g.inner, false, g.is_unsafe),
             _ => continue,
         };
 
@@ -2045,10 +2045,18 @@ fn lower_op(
                 diag,
             ),
         },
-        AstOp::GpuThreadId { .. } => HirOp::GpuThreadId,
-        AstOp::GpuWorkgroupId { .. } => HirOp::GpuWorkgroupId,
-        AstOp::GpuWorkgroupSize { .. } => HirOp::GpuWorkgroupSize,
-        AstOp::GpuGlobalId { .. } => HirOp::GpuGlobalId,
+        AstOp::GpuThreadId { dim } => HirOp::GpuThreadId {
+            dim: lower_gpu_dim(dim),
+        },
+        AstOp::GpuWorkgroupId { dim } => HirOp::GpuWorkgroupId {
+            dim: lower_gpu_dim(dim),
+        },
+        AstOp::GpuWorkgroupSize { dim } => HirOp::GpuWorkgroupSize {
+            dim: lower_gpu_dim(dim),
+        },
+        AstOp::GpuGlobalId { dim } => HirOp::GpuGlobalId {
+            dim: lower_gpu_dim(dim),
+        },
         AstOp::GpuBufferLoad { buf, idx, .. } => HirOp::GpuBufferLoad {
             buf: lower_value_ref(
                 buf,
@@ -2116,7 +2124,7 @@ fn lower_op(
                 diag,
             ),
             kernel: resolve_fn_sid(kernel, module_path, resolved, import_map),
-            groups: lower_arg_value_single(
+            grid: lower_arg_value_triplet(
                 grid,
                 module_path,
                 &resolved.symbol_table,
@@ -2125,9 +2133,8 @@ fn lower_op(
                 locals,
                 type_ctx,
                 diag,
-            )
-            .unwrap_or_else(unit_hir_value),
-            threads: lower_arg_value_single(
+            ),
+            block: lower_arg_value_triplet(
                 block,
                 module_path,
                 &resolved.symbol_table,
@@ -2136,8 +2143,7 @@ fn lower_op(
                 locals,
                 type_ctx,
                 diag,
-            )
-            .unwrap_or_else(unit_hir_value),
+            ),
             args: lower_arg_value_list(
                 args,
                 module_path,
@@ -2167,7 +2173,7 @@ fn lower_op(
                 diag,
             ),
             kernel: resolve_fn_sid(kernel, module_path, resolved, import_map),
-            groups: lower_arg_value_single(
+            grid: lower_arg_value_triplet(
                 grid,
                 module_path,
                 &resolved.symbol_table,
@@ -2176,9 +2182,8 @@ fn lower_op(
                 locals,
                 type_ctx,
                 diag,
-            )
-            .unwrap_or_else(unit_hir_value),
-            threads: lower_arg_value_single(
+            ),
+            block: lower_arg_value_triplet(
                 block,
                 module_path,
                 &resolved.symbol_table,
@@ -2187,8 +2192,7 @@ fn lower_op(
                 locals,
                 type_ctx,
                 diag,
-            )
-            .unwrap_or_else(unit_hir_value),
+            ),
             args: lower_arg_value_list(
                 args,
                 module_path,
@@ -2746,7 +2750,21 @@ fn lower_call_args(
     out
 }
 
-fn lower_arg_value_single(
+fn lower_gpu_dim(dim: &AstValueRef) -> u8 {
+    let AstValueRef::Const(AstConstExpr {
+        lit: AstConstLit::Int(v),
+        ..
+    }) = dim
+    else {
+        return u8::MAX;
+    };
+    let Ok(dim) = u8::try_from(*v) else {
+        return u8::MAX;
+    };
+    dim
+}
+
+fn lower_arg_value_triplet(
     arg: &AstArgValue,
     module_path: &str,
     symbol_table: &SymbolTable,
@@ -2755,67 +2773,44 @@ fn lower_arg_value_single(
     locals: &HashMap<String, LocalId>,
     type_ctx: &mut TypeCtx,
     diag: &mut DiagnosticBag,
-) -> Option<HirValue> {
-    match arg {
-        AstArgValue::Value(v) => Some(lower_value_ref(
-            v,
-            module_path,
-            symbol_table,
-            import_map,
-            value_types,
-            locals,
-            type_ctx,
+) -> [HirValue; 3] {
+    let values = lower_arg_value_list(
+        arg,
+        module_path,
+        symbol_table,
+        import_map,
+        value_types,
+        locals,
+        type_ctx,
+        diag,
+    );
+
+    if values.len() != 3 {
+        emit_error(
             diag,
-        )),
-        AstArgValue::List(v) => {
-            if v.len() == 1 {
-                match &v[0] {
-                    AstArgListElem::Value(v) => Some(lower_value_ref(
-                        v,
-                        module_path,
-                        symbol_table,
-                        import_map,
-                        value_types,
-                        locals,
-                        type_ctx,
-                        diag,
-                    )),
-                    AstArgListElem::FnRef(name) => {
-                        emit_error(
-                            diag,
-                            "MPS0012",
-                            None,
-                            format!(
-                                "Function reference '{}' cannot be lowered as a value in this position.",
-                                name
-                            ),
-                        );
-                        None
-                    }
-                }
-            } else {
-                emit_error(
-                    diag,
-                    "MPS0013",
-                    None,
-                    "Expected a single argument value.".to_string(),
-                );
-                None
-            }
-        }
-        AstArgValue::FnRef(name) => {
-            emit_error(
-                diag,
-                "MPS0014",
-                None,
-                format!(
-                    "Function reference '{}' cannot be lowered as a value in this position.",
-                    name
-                ),
-            );
-            None
-        }
+            "MPS0001",
+            None,
+            format!(
+                "Invalid operand: expected exactly 3 dimensions for gpu launch, got {}.",
+                values.len()
+            ),
+        );
     }
+
+    [
+        values
+            .first()
+            .cloned()
+            .unwrap_or_else(|| const_u32_hir_value(1)),
+        values
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| const_u32_hir_value(1)),
+        values
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| const_u32_hir_value(1)),
+    ]
 }
 
 fn lower_arg_value_list(
@@ -3327,6 +3322,7 @@ fn prim_type_from_name(name: &str) -> Option<PrimType> {
         "u64" => Some(PrimType::U64),
         "u128" => Some(PrimType::U128),
         "f16" => Some(PrimType::F16),
+        "bf16" => Some(PrimType::Bf16),
         "f32" => Some(PrimType::F32),
         "f64" => Some(PrimType::F64),
         "bool" => Some(PrimType::Bool),
@@ -3350,6 +3346,7 @@ fn prim_type_str(p: PrimType) -> &'static str {
         PrimType::U64 => "u64",
         PrimType::U128 => "u128",
         PrimType::F16 => "f16",
+        PrimType::Bf16 => "bf16",
         PrimType::F32 => "f32",
         PrimType::F64 => "f64",
         PrimType::Bool => "bool",
@@ -3430,10 +3427,15 @@ fn collect_module_symbols(
 
     for decl in &file.decls {
         match &decl.node {
-            AstDecl::Fn(f)
-            | AstDecl::AsyncFn(f)
-            | AstDecl::GpuFn(magpie_ast::AstGpuFnDecl { inner: f, .. }) => {
+            AstDecl::Fn(f) | AstDecl::AsyncFn(f) => {
                 insert_fn_symbol(table, module_path, &f.name, false, decl.span, diag);
+            }
+            AstDecl::GpuFn(magpie_ast::AstGpuFnDecl {
+                inner: f,
+                is_unsafe,
+                ..
+            }) => {
+                insert_fn_symbol(table, module_path, &f.name, *is_unsafe, decl.span, diag);
             }
             AstDecl::UnsafeFn(f) => {
                 insert_fn_symbol(table, module_path, &f.name, true, decl.span, diag);
@@ -3825,6 +3827,13 @@ fn unit_hir_value() -> HirValue {
     HirValue::Const(HirConst {
         ty: fixed_type_ids::UNIT,
         lit: HirConstLit::Unit,
+    })
+}
+
+fn const_u32_hir_value(v: u32) -> HirValue {
+    HirValue::Const(HirConst {
+        ty: fixed_type_ids::U32,
+        lit: HirConstLit::IntLit(i128::from(v)),
     })
 }
 
@@ -4972,7 +4981,7 @@ fn sema_is_borrow_for_trait_target(
 fn sema_seed_builtin_trait_impls(impls: &mut HashSet<(String, String)>) {
     let prims = [
         "bool", "i8", "i16", "i32", "i64", "i128", "u1", "u8", "u16", "u32", "u64", "u128", "f16",
-        "f32", "f64",
+        "bf16", "f32", "f64",
     ];
     for p in prims {
         let key = format!("prim:{}", p);
@@ -5129,6 +5138,7 @@ fn sema_is_lang_owned_type_name(name: &str) -> bool {
             | "u64"
             | "u128"
             | "f16"
+            | "bf16"
             | "f32"
             | "f64"
     )

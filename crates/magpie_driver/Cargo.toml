@@ -24,10 +24,15 @@ magpie_own = { path = "../magpie_own" }
 magpie_mpir = { path = "../magpie_mpir" }
 magpie_arc = { path = "../magpie_arc" }
 magpie_gpu = { path = "../magpie_gpu" }
+magpie_gpu_msl = { path = "../magpie_gpu_msl" }
+magpie_gpu_ptx = { path = "../magpie_gpu_ptx" }
+magpie_gpu_hip = { path = "../magpie_gpu_hip" }
+magpie_gpu_wgsl = { path = "../magpie_gpu_wgsl" }
 magpie_diag = { path = "../magpie_diag" }
 magpie_pkg = { path = "../magpie_pkg" }
 magpie_memory = { path = "../magpie_memory" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 blake3 = { workspace = true }
 regex = "1"

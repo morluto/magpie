@@ -1,0 +1,8 @@
+[package]
+name = "magpie_mlx"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_types = { path = "../magpie_types" }
+magpie_diag = { path = "../magpie_diag" }

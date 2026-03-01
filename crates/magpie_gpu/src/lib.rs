@@ -6,10 +6,69 @@
     clippy::too_many_arguments
 )]
 
-use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
-use magpie_mpir::{HirConstLit, MpirFn, MpirOp, MpirOpVoid, MpirTerminator, MpirValue};
+use magpie_diag::{DiagnosticBag, Severity};
+use magpie_mpir::{HirConstLit, MpirOp, MpirOpVoid, MpirTerminator, MpirValue};
 use magpie_types::{fixed_type_ids, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
 use std::collections::{HashMap, HashSet};
+
+pub mod structurize;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GpuBackend {
+    Spv = 1,
+    Msl = 2,
+    Ptx = 3,
+    Hip = 4,
+    Wgsl = 5,
+}
+
+impl GpuBackend {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "spv" => Some(Self::Spv),
+            "msl" => Some(Self::Msl),
+            "ptx" => Some(Self::Ptx),
+            "hip" => Some(Self::Hip),
+            "wgsl" => Some(Self::Wgsl),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spv => "spv",
+            Self::Msl => "msl",
+            Self::Ptx => "ptx",
+            Self::Hip => "hip",
+            Self::Wgsl => "wgsl",
+        }
+    }
+}
+
+use magpie_diag::Diagnostic;
+use magpie_mpir::{MpirFn, MpirTypeTable};
+
+pub trait BackendEmitter {
+    fn backend_id(&self) -> GpuBackend;
+    fn validate_kernel(
+        &self,
+        kernel: &MpirFn,
+        types: &MpirTypeTable,
+    ) -> Result<(), Vec<Diagnostic>>;
+    fn compute_layout(
+        &self,
+        kernel: &MpirFn,
+        types: &MpirTypeTable,
+    ) -> Result<KernelLayout, String>;
+    fn emit_kernel(
+        &self,
+        kernel: &MpirFn,
+        types: &MpirTypeTable,
+        layout: &KernelLayout,
+    ) -> Result<Vec<u8>, String>;
+    fn artifact_extension(&self) -> &str;
+}
 
 pub const GPU_BACKEND_SPV: u32 = 1;
 
@@ -37,11 +96,10 @@ pub struct KernelLayout {
     pub push_const_size: u32,
 }
 
-/// Runtime entry layout matching `MpRtGpuKernelEntry` (§20.1.7).
+/// Runtime blob layout matching `MpRtGpuKernelBlob`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct KernelEntry {
-    pub sid_hash: u64,
+pub struct KernelBlob {
     pub backend: u32,
     pub blob: *const u8,
     pub blob_len: u64,
@@ -49,6 +107,16 @@ pub struct KernelEntry {
     pub params: *const KernelParam,
     pub num_buffers: u32,
     pub push_const_size: u32,
+}
+
+/// Runtime entry layout matching `MpRtGpuKernelEntry`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct KernelEntry {
+    pub sid_hash: u64,
+    pub num_blobs: u32,
+    pub _reserved: u32,
+    pub blobs: *const KernelBlob,
 }
 
 /// Enforce `gpu fn` restrictions from §31.3.
@@ -81,7 +149,7 @@ pub fn validate_kernel(
                 | MpirOp::CallableCapture { .. } => {
                     emit_kernel_error(
                         diag,
-                        "MPG1100",
+                        "MPG_CORE_1100",
                         "heap allocation is forbidden in gpu kernels",
                     );
                 }
@@ -96,7 +164,7 @@ pub fn validate_kernel(
                 | MpirOp::WeakUpgrade { .. } => {
                     emit_kernel_error(
                         diag,
-                        "MPG1101",
+                        "MPG_CORE_1101",
                         "ARC/ownership runtime operations are forbidden in gpu kernels",
                     );
                 }
@@ -108,13 +176,17 @@ pub fn validate_kernel(
                 | MpirOp::ArrForeach { .. } => {
                     emit_kernel_error(
                         diag,
-                        "MPG1102",
+                        "MPG_CORE_1102",
                         "TCallable/dynamic dispatch is forbidden in gpu kernels",
                     );
                 }
                 MpirOp::Call { callee_sid, .. } | MpirOp::SuspendCall { callee_sid, .. } => {
                     if callee_sid == &func.sid {
-                        emit_kernel_error(diag, "MPG1103", "recursive kernel calls are forbidden");
+                        emit_kernel_error(
+                            diag,
+                            "MPG_CORE_1103",
+                            "recursive kernel calls are forbidden",
+                        );
                     }
                 }
                 _ => {}
@@ -131,13 +203,17 @@ pub fn validate_kernel(
             match op {
                 MpirOpVoid::CallVoid { callee_sid, .. } => {
                     if callee_sid == &func.sid {
-                        emit_kernel_error(diag, "MPG1103", "recursive kernel calls are forbidden");
+                        emit_kernel_error(
+                            diag,
+                            "MPG_CORE_1103",
+                            "recursive kernel calls are forbidden",
+                        );
                     }
                 }
                 MpirOpVoid::CallVoidIndirect { .. } => {
                     emit_kernel_error(
                         diag,
-                        "MPG1102",
+                        "MPG_CORE_1102",
                         "TCallable/dynamic dispatch is forbidden in gpu kernels",
                     );
                 }
@@ -147,7 +223,7 @@ pub fn validate_kernel(
                 | MpirOpVoid::ArcReleaseWeak { .. } => {
                     emit_kernel_error(
                         diag,
-                        "MPG1101",
+                        "MPG_CORE_1101",
                         "ARC operations are forbidden in gpu kernels",
                     );
                 }
@@ -297,7 +373,7 @@ fn prim_size_bytes(prim: PrimType) -> u32 {
         PrimType::Unit => 0,
         PrimType::I1 | PrimType::U1 | PrimType::Bool => 1,
         PrimType::I8 | PrimType::U8 => 1,
-        PrimType::I16 | PrimType::U16 | PrimType::F16 => 2,
+        PrimType::I16 | PrimType::U16 | PrimType::F16 | PrimType::Bf16 => 2,
         PrimType::I32 | PrimType::U32 | PrimType::F32 => 4,
         PrimType::I64 | PrimType::U64 | PrimType::F64 => 8,
         PrimType::I128 | PrimType::U128 => 16,
@@ -308,22 +384,22 @@ fn check_kernel_type(ty: TypeId, type_ctx: &TypeCtx, diag: &mut DiagnosticBag, w
     match forbidden_kernel_type(ty, type_ctx, &mut HashSet::new()) {
         Some("Str") => emit_kernel_error(
             diag,
-            "MPG1104",
+            "MPG_CORE_1104",
             &format!("{where_}: Str is not allowed in gpu kernels"),
         ),
         Some("Array") => emit_kernel_error(
             diag,
-            "MPG1105",
+            "MPG_CORE_1105",
             &format!("{where_}: Array is not allowed in gpu kernels"),
         ),
         Some("Map") => emit_kernel_error(
             diag,
-            "MPG1106",
+            "MPG_CORE_1106",
             &format!("{where_}: Map is not allowed in gpu kernels"),
         ),
         Some("TCallable") => emit_kernel_error(
             diag,
-            "MPG1107",
+            "MPG_CORE_1107",
             &format!("{where_}: TCallable is not allowed in gpu kernels"),
         ),
         _ => {}
@@ -452,6 +528,7 @@ struct SpirvKernelIds {
     global_invocation_id_var: u32,
     const_int_0: u32,
     const_int_1: u32,
+    const_int_2: u32,
     const_float_0: u32,
     const_float_1: u32,
     const_bool_false: u32,
@@ -755,6 +832,9 @@ impl SpirvBuilder {
 
         ids.const_int_1 = self.new_id();
         self.emit_inst(Self::OP_CONSTANT, &[ids.int_ty, ids.const_int_1, 1]);
+
+        ids.const_int_2 = self.new_id();
+        self.emit_inst(Self::OP_CONSTANT, &[ids.int_ty, ids.const_int_2, 2]);
 
         ids.const_float_0 = self.new_id();
         self.emit_inst(
@@ -1102,7 +1182,13 @@ impl SpirvBuilder {
                 self.set_local_value(instr.dst.0, result_id, ids.bool_ty, state);
             }
 
-            MpirOp::GpuGlobalId => {
+            MpirOp::GpuGlobalId { dim } => {
+                let dim_index = match dim {
+                    0 => ids.const_int_0,
+                    1 => ids.const_int_1,
+                    2 => ids.const_int_2,
+                    _ => ids.const_int_0,
+                };
                 let ptr_id = self.new_id();
                 self.emit_inst(
                     Self::OP_ACCESS_CHAIN,
@@ -1110,7 +1196,7 @@ impl SpirvBuilder {
                         ids.ptr_input_int_ty,
                         ptr_id,
                         ids.global_invocation_id_var,
-                        ids.const_int_0,
+                        dim_index,
                     ],
                 );
                 let raw_id = self.new_id();
@@ -1597,7 +1683,8 @@ pub fn embed_spirv_as_llvm_const(spirv_bytes: &[u8], symbol_name: &str) -> Strin
     )
 }
 
-pub fn generate_kernel_registry_ir(kernels: &[(String, KernelLayout, Vec<u8>)]) -> String {
+pub fn generate_kernel_registry_ir(kernels: &[(String, u8, KernelLayout, Vec<u8>)]) -> String {
+    use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -1605,13 +1692,14 @@ pub fn generate_kernel_registry_ir(kernels: &[(String, KernelLayout, Vec<u8>)]) 
     writeln!(out, "%MpRtGpuParam = type {{ i8, i32, i32, i32 }}").unwrap();
     writeln!(
         out,
-        "%MpRtGpuKernelEntry = type {{ i64, i32, ptr, i64, i32, ptr, i32, i32 }}"
+        "%MpRtGpuKernelBlob = type {{ i32, ptr, i64, i32, ptr, i32, i32 }}"
     )
     .unwrap();
+    writeln!(out, "%MpRtGpuKernelEntry = type {{ i64, i32, i32, ptr }}").unwrap();
     writeln!(out).unwrap();
 
-    for (idx, (_, layout, blob)) in kernels.iter().enumerate() {
-        let blob_sym = format!("mp_gpu_spv_blob_{idx}");
+    for (idx, (_, backend, layout, blob)) in kernels.iter().enumerate() {
+        let blob_sym = format!("mp_gpu_blob_{}_{}", backend, idx);
         writeln!(out, "{}", embed_spirv_as_llvm_const(blob, &blob_sym)).unwrap();
 
         if !layout.params.is_empty() {
@@ -1633,39 +1721,63 @@ pub fn generate_kernel_registry_ir(kernels: &[(String, KernelLayout, Vec<u8>)]) 
         writeln!(out).unwrap();
     }
 
-    let mut entries = Vec::with_capacity(kernels.len());
-    for (idx, (sid_str, layout, blob)) in kernels.iter().enumerate() {
-        let sid_hash = sid_hash_64(&Sid(sid_str.clone()));
-        let blob_sym = format!("mp_gpu_spv_blob_{idx}");
-        let blob_ptr = format!(
-            "ptr getelementptr inbounds ([{} x i8], ptr @{}, i64 0, i64 0)",
-            blob.len(),
-            blob_sym
-        );
-        let params_ptr = if layout.params.is_empty() {
-            "ptr null".to_string()
-        } else {
-            format!(
-                "ptr getelementptr inbounds ([{} x %MpRtGpuParam], ptr @mp_gpu_kernel_params_{}, i64 0, i64 0)",
-                layout.params.len(),
-                idx
-            )
-        };
+    let mut grouped: BTreeMap<String, Vec<(usize, u8, &KernelLayout, &Vec<u8>)>> = BTreeMap::new();
+    for (idx, (sid, backend, layout, blob)) in kernels.iter().enumerate() {
+        grouped
+            .entry(sid.clone())
+            .or_default()
+            .push((idx, *backend, layout, blob));
+    }
 
+    let mut entries = Vec::with_capacity(grouped.len());
+    for (sid_idx, (sid_str, blobs)) in grouped.iter().enumerate() {
+        let mut blob_entries = Vec::with_capacity(blobs.len());
+        for (kernel_idx, backend, layout, blob) in blobs {
+            let blob_sym = format!("mp_gpu_blob_{}_{}", backend, kernel_idx);
+            let blob_ptr = format!(
+                "ptr getelementptr inbounds ([{} x i8], ptr @{}, i64 0, i64 0)",
+                blob.len(),
+                blob_sym
+            );
+            let params_ptr = if layout.params.is_empty() {
+                "ptr null".to_string()
+            } else {
+                format!(
+                    "ptr getelementptr inbounds ([{} x %MpRtGpuParam], ptr @mp_gpu_kernel_params_{}, i64 0, i64 0)",
+                    layout.params.len(),
+                    kernel_idx
+                )
+            };
+            blob_entries.push(format!(
+                "%MpRtGpuKernelBlob {{ i32 {backend}, {blob_ptr}, i64 {blob_len}, i32 {num_params}, {params_ptr}, i32 {num_buffers}, i32 {push_const_size} }}",
+                blob_len = blob.len(),
+                num_params = layout.params.len(),
+                num_buffers = layout.num_buffers,
+                push_const_size = layout.push_const_size,
+            ));
+        }
+
+        let blobs_sym = format!("mp_gpu_kernel_blobs_{sid_idx}");
+        writeln!(
+            out,
+            "@{blobs_sym} = private constant [{} x %MpRtGpuKernelBlob] [{}]",
+            blob_entries.len(),
+            blob_entries.join(", ")
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+
+        let sid_hash = sid_hash_64(&Sid(sid_str.clone()));
         entries.push(format!(
-            "%MpRtGpuKernelEntry {{ i64 {sid_hash}, i32 {backend}, ptr {blob_ptr}, i64 {blob_len}, i32 {num_params}, ptr {params_ptr}, i32 {num_buffers}, i32 {push_const_size} }}",
-            backend = GPU_BACKEND_SPV,
-            blob_len = blob.len(),
-            num_params = layout.params.len(),
-            num_buffers = layout.num_buffers,
-            push_const_size = layout.push_const_size,
+            "%MpRtGpuKernelEntry {{ i64 {sid_hash}, i32 {num_blobs}, i32 0, ptr getelementptr inbounds ([{num_blobs} x %MpRtGpuKernelBlob], ptr @{blobs_sym}, i64 0, i64 0) }}",
+            num_blobs = blob_entries.len(),
         ));
     }
 
     writeln!(
         out,
         "@mp_gpu_kernel_registry = private constant [{} x %MpRtGpuKernelEntry] [{}]",
-        kernels.len(),
+        entries.len(),
         entries.join(", ")
     )
     .unwrap();
@@ -1676,12 +1788,12 @@ pub fn generate_kernel_registry_ir(kernels: &[(String, KernelLayout, Vec<u8>)]) 
 
     writeln!(out, "define void @mp_gpu_register_all_kernels() {{").unwrap();
     writeln!(out, "entry:").unwrap();
-    if !kernels.is_empty() {
+    if !entries.is_empty() {
         writeln!(
             out,
             "  call void @mp_rt_gpu_register_kernels(ptr getelementptr inbounds ([{} x %MpRtGpuKernelEntry], ptr @mp_gpu_kernel_registry, i64 0, i64 0), i32 {})",
-            kernels.len(),
-            kernels.len()
+            entries.len(),
+            entries.len()
         )
         .unwrap();
     }

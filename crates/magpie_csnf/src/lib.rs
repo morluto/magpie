@@ -192,7 +192,7 @@ fn format_imports(imports: &[Spanned<ImportGroup>]) -> String {
     format!("{{ {} }}", join_comma(groups))
 }
 
-fn print_fn_decl(prefix: &str, f: &AstFnDecl, gpu_target: Option<&str>) -> String {
+fn print_fn_decl(prefix: &str, f: &AstFnDecl, gpu_decl: Option<&AstGpuFnDecl>) -> String {
     let mut out = String::new();
     push_doc(&mut out, f.doc.as_deref());
 
@@ -204,10 +204,25 @@ fn print_fn_decl(prefix: &str, f: &AstFnDecl, gpu_target: Option<&str>) -> Strin
     out.push_str(") -> ");
     out.push_str(&print_type(&f.ret_ty.node));
 
-    if let Some(target) = gpu_target {
+    if let Some(gpu) = gpu_decl {
         out.push_str(" target(");
-        out.push_str(target);
+        out.push_str(&gpu.target);
         out.push(')');
+
+        if let Some([x, y, z]) = gpu.workgroup {
+            out.push_str(" workgroup(");
+            out.push_str(&format!("{}, {}, {}", x, y, z));
+            out.push(')');
+        }
+
+        if !gpu.requires.is_empty() {
+            let mut requires = gpu.requires.clone();
+            requires.sort();
+            requires.dedup();
+            out.push_str(" requires(");
+            out.push_str(&requires.join(", "));
+            out.push(')');
+        }
     }
 
     if let Some(meta) = &f.meta {
@@ -225,7 +240,12 @@ fn print_fn_decl(prefix: &str, f: &AstFnDecl, gpu_target: Option<&str>) -> Strin
 }
 
 fn print_gpu_fn_decl(gpu: &AstGpuFnDecl) -> String {
-    print_fn_decl("gpu fn", &gpu.inner, Some(&gpu.target))
+    let prefix = if gpu.is_unsafe {
+        "unsafe gpu fn"
+    } else {
+        "gpu fn"
+    };
+    print_fn_decl(prefix, &gpu.inner, Some(gpu))
 }
 
 fn print_blocks(blocks: &[&AstBlock]) -> String {

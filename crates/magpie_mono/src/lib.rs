@@ -372,6 +372,7 @@ fn canonical_type_str(ty: TypeId, type_ctx: &TypeCtx) -> String {
             magpie_hir::PrimType::U64 => "u64".to_string(),
             magpie_hir::PrimType::U128 => "u128".to_string(),
             magpie_hir::PrimType::F16 => "f16".to_string(),
+            magpie_hir::PrimType::Bf16 => "bf16".to_string(),
             magpie_hir::PrimType::F32 => "f32".to_string(),
             magpie_hir::PrimType::F64 => "f64".to_string(),
             magpie_hir::PrimType::Bool => "bool".to_string(),
@@ -728,10 +729,10 @@ fn substitute_op_types(
             *ty = substitute_type(*ty, param_map, type_ctx);
             substitute_value_types(s, param_map, type_ctx);
         }
-        HirOp::GpuThreadId
-        | HirOp::GpuWorkgroupId
-        | HirOp::GpuWorkgroupSize
-        | HirOp::GpuGlobalId => {}
+        HirOp::GpuThreadId { .. }
+        | HirOp::GpuWorkgroupId { .. }
+        | HirOp::GpuWorkgroupSize { .. }
+        | HirOp::GpuGlobalId { .. } => {}
         HirOp::GpuBufferLoad { buf, idx } => {
             substitute_value_types(buf, param_map, type_ctx);
             substitute_value_types(idx, param_map, type_ctx);
@@ -745,21 +746,25 @@ fn substitute_op_types(
         }
         HirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | HirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
             substitute_value_types(device, param_map, type_ctx);
-            substitute_value_types(groups, param_map, type_ctx);
-            substitute_value_types(threads, param_map, type_ctx);
+            for v in grid {
+                substitute_value_types(v, param_map, type_ctx);
+            }
+            for v in block {
+                substitute_value_types(v, param_map, type_ctx);
+            }
             for arg in args {
                 substitute_value_types(arg, param_map, type_ctx);
             }

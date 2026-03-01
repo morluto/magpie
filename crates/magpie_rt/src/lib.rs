@@ -8,13 +8,13 @@
 use std::alloc::{self, Layout};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, Once, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // §20.1.1  Object header
@@ -270,14 +270,16 @@ pub unsafe extern "C" fn mp_rt_release_strong(obj: *mut MpRtHeader) {
         std::sync::atomic::fence(Ordering::Acquire);
 
         // Call the type-registered drop_fn if present.
+        // IMPORTANT: We must release the registry lock BEFORE calling drop_fn,
+        // because drop_fn may call mp_rt_release_strong on inner objects,
+        // which would re-acquire the same non-reentrant Mutex (deadlock).
         let type_id = (*obj).type_id;
-        {
+        let drop_fn_opt = {
             let reg = registry().lock().unwrap();
-            if let Some(info) = reg.find(type_id) {
-                if let Some(drop_fn) = info.drop_fn {
-                    drop_fn(obj);
-                }
-            }
+            reg.find(type_id).and_then(|info| info.drop_fn)
+        };
+        if let Some(drop_fn) = drop_fn_opt {
+            drop_fn(obj);
         }
 
         // For builtin types (Str, StringBuilder) we have internal cleanup.
@@ -2018,10 +2020,60 @@ pub unsafe extern "C" fn mp_rt_web_serve(
     0
 }
 
-const TYPE_ID_GPU_DEVICE_RT: u32 = 9001;
-const TYPE_ID_GPU_BUFFER_RT: u32 = 9002;
-const TYPE_ID_GPU_FENCE_RT: u32 = 9003;
-const TYPE_ID_GPU_KERNEL_RT: u32 = 9004;
+const TYPE_ID_GPU_DEVICE_RT: u32 = 30;
+const TYPE_ID_GPU_BUFFER_RT: u32 = 31;
+const TYPE_ID_GPU_FENCE_RT: u32 = 32;
+const TYPE_ID_GPU_KERNEL_RT: u32 = 50;
+const TYPE_ID_GPU_ERROR: u32 = 33;
+const TYPE_ID_GPU_ERROR_KIND: u32 = 34;
+const TYPE_ID_GPU_PROFILE_SESSION: u32 = 35;
+const TYPE_ID_GPU_PROFILE_EVENT: u32 = 36;
+const TYPE_ID_GPU_MEMORY_STATS: u32 = 37;
+const TYPE_ID_MLX_ARRAY: u32 = 38;
+const TYPE_ID_MLX_LAYER_HANDLE: u32 = 39;
+const TYPE_ID_MLX_OPTIMIZER_HANDLE: u32 = 40;
+
+const GPU_ERROR_DEVICE_LOST: i32 = 0;
+const GPU_ERROR_OUT_OF_MEMORY: i32 = 1;
+const GPU_ERROR_LAUNCH_FAILED: i32 = 2;
+const GPU_ERROR_INVALID_KERNEL: i32 = 3;
+const GPU_ERROR_BACKEND_UNAVAILABLE: i32 = 4;
+const GPU_ERROR_BUFFER_ERROR: i32 = 5;
+const GPU_ERROR_TIMEOUT_EXPIRED: i32 = 6;
+const GPU_ERROR_UNSUPPORTED: i32 = 7;
+const GPU_ERROR_COMPILATION_FAILED: i32 = 8;
+const GPU_ERROR_DRIVER_ERROR: i32 = 9;
+const GPU_ERROR_RESOURCE_EXHAUSTED: i32 = 10;
+const GPU_ERROR_VALIDATION_FAILED: i32 = 11;
+
+#[allow(dead_code)]
+struct GpuDispatchTable {
+    backend_name: &'static str,
+    lib_handle: *mut std::ffi::c_void,
+    // Function pointers loaded via dlsym
+    create_device: Option<unsafe extern "C" fn() -> *mut std::ffi::c_void>,
+    destroy_device: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    alloc_buffer: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u64) -> *mut std::ffi::c_void>,
+    free_buffer: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    launch_kernel: Option<
+        unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *const u8,
+            u64,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *const u8,
+            u64,
+        ) -> i32,
+    >,
+}
+
+unsafe impl Send for GpuDispatchTable {}
+unsafe impl Sync for GpuDispatchTable {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2038,6 +2090,14 @@ struct MpRtGpuParam {
 #[derive(Clone, Copy)]
 struct MpRtGpuKernelEntry {
     sid_hash: u64,
+    num_blobs: u32,
+    _reserved: u32,
+    blobs: *const MpRtGpuKernelBlob,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MpRtGpuKernelBlob {
     backend: u32,
     blob: *const u8,
     blob_len: u64,
@@ -2074,6 +2134,47 @@ struct MpRtGpuKernelPayload {
     blob: UnsafeCell<Vec<u8>>,
 }
 
+#[repr(C)]
+struct MpRtGpuErrorPayload {
+    kind: i32,
+    backend: *mut MpRtHeader,
+    message: *mut MpRtHeader,
+    code: i32,
+}
+
+#[repr(C)]
+struct MpRtGpuProfileSessionPayload {
+    device: *mut MpRtHeader,
+    events: Vec<MpRtGpuProfileEventData>,
+    counters_enabled: Vec<String>,
+    start_time_ns: u64,
+}
+
+struct MpRtGpuProfileEventData {
+    name: String,
+    start_ns: u64,
+    end_ns: u64,
+    metadata: Vec<(String, String)>,
+}
+
+#[repr(C)]
+struct MpRtGpuProfileEventPayload {
+    name: *mut MpRtHeader,
+    start_ns: u64,
+    end_ns: u64,
+    metadata: *mut MpRtHeader,
+}
+
+#[repr(C)]
+struct MpRtGpuMemoryStatsPayload {
+    allocated_bytes: u64,
+    peak_allocated_bytes: u64,
+    num_allocations: u64,
+    num_frees: u64,
+    device_total_bytes: u64,
+    device_available_bytes: u64,
+}
+
 #[derive(Clone, Copy)]
 struct GpuKernelMeta {
     num_buffers: u32,
@@ -2083,19 +2184,132 @@ struct GpuKernelMeta {
 static GPU_REGISTERED_KERNEL_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_TYPES_ONCE: Once = Once::new();
 static GPU_KERNEL_REGISTRY: OnceLock<RwLock<HashMap<u64, GpuKernelMeta>>> = OnceLock::new();
+static GPU_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static GPU_ALLOC_PEAK: AtomicU64 = AtomicU64::new(0);
+static GPU_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+static GPU_FREE_COUNT: AtomicU64 = AtomicU64::new(0);
+static GPU_DISPATCH: OnceLock<RwLock<Option<GpuDispatchTable>>> = OnceLock::new();
 
 fn gpu_kernel_registry() -> &'static RwLock<HashMap<u64, GpuKernelMeta>> {
     GPU_KERNEL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn gpu_dispatch() -> &'static RwLock<Option<GpuDispatchTable>> {
+    GPU_DISPATCH.get_or_init(|| RwLock::new(None))
+}
+
+fn gpu_backend_name() -> Option<&'static str> {
+    let dispatch = gpu_dispatch().read().unwrap();
+    dispatch.as_ref().map(|table| table.backend_name)
+}
+
+fn gpu_backend_name_or_fallback() -> &'static str {
+    gpu_backend_name().unwrap_or("cpu-fallback")
+}
+
+fn gpu_backend_id_from_name(name: &str) -> Option<u32> {
+    match name {
+        "vulkan" => Some(1),
+        "metal" => Some(2),
+        "cuda" => Some(3),
+        "hip" => Some(4),
+        "wgpu" => Some(5),
+        _ => None,
+    }
+}
+
+unsafe fn gpu_select_blob(entry: &MpRtGpuKernelEntry) -> Option<MpRtGpuKernelBlob> {
+    if entry.num_blobs == 0 || entry.blobs.is_null() {
+        return None;
+    }
+    let blobs = std::slice::from_raw_parts(entry.blobs, entry.num_blobs as usize);
+    let preferred = gpu_backend_id_from_name(gpu_backend_name_or_fallback());
+    if let Some(preferred_backend) = preferred {
+        if let Some(blob) = blobs.iter().find(|blob| blob.backend == preferred_backend) {
+            return Some(*blob);
+        }
+    }
+    blobs.first().copied()
+}
+
+fn gpu_now_ns() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    }
+}
+
+fn gpu_record_alloc(bytes: u64) {
+    GPU_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let total = GPU_ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    loop {
+        let peak = GPU_ALLOC_PEAK.load(Ordering::Relaxed);
+        if total <= peak {
+            break;
+        }
+        if GPU_ALLOC_PEAK
+            .compare_exchange(peak, total, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+fn gpu_record_free(bytes: u64) {
+    GPU_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+    let _ = GPU_ALLOC_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+}
+
+unsafe extern "C" fn mp_rt_gpu_profile_session_drop(obj: *mut MpRtHeader) {
+    let payload = profile_session_payload(obj);
+    if !(*payload).device.is_null() {
+        mp_rt_release_strong((*payload).device);
+        (*payload).device = std::ptr::null_mut();
+    }
+    std::ptr::drop_in_place(&mut (*payload).events);
+    std::ptr::drop_in_place(&mut (*payload).counters_enabled);
+}
+
+unsafe extern "C" fn mp_rt_gpu_profile_event_drop(obj: *mut MpRtHeader) {
+    let payload = profile_event_payload(obj);
+    if !(*payload).name.is_null() {
+        mp_rt_release_strong((*payload).name);
+        (*payload).name = std::ptr::null_mut();
+    }
+    if !(*payload).metadata.is_null() {
+        mp_rt_release_strong((*payload).metadata);
+        (*payload).metadata = std::ptr::null_mut();
+    }
+}
+
 unsafe extern "C" fn mp_rt_gpu_buffer_drop(obj: *mut MpRtHeader) {
     let payload = gpu_buffer_payload(obj);
+    let bytes = (&*(*payload).bytes.get()).len() as u64;
     std::ptr::drop_in_place((*payload).bytes.get());
+    gpu_record_free(bytes);
 }
 
 unsafe extern "C" fn mp_rt_gpu_kernel_drop(obj: *mut MpRtHeader) {
     let payload = gpu_kernel_payload(obj);
     std::ptr::drop_in_place((*payload).blob.get());
+}
+
+unsafe extern "C" fn mp_rt_gpu_error_drop_impl(obj: *mut MpRtHeader) {
+    if obj.is_null() {
+        return;
+    }
+    let payload = gpu_error_payload(obj);
+    if !(*payload).backend.is_null() {
+        mp_rt_release_strong((*payload).backend);
+        (*payload).backend = std::ptr::null_mut();
+    }
+    if !(*payload).message.is_null() {
+        mp_rt_release_strong((*payload).message);
+        (*payload).message = std::ptr::null_mut();
+    }
 }
 
 fn ensure_gpu_types_registered() {
@@ -2126,12 +2340,44 @@ fn ensure_gpu_types_registered() {
                 debug_fqn: c"gpu.Fence".as_ptr(),
             },
             MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_ERROR,
+                flags: FLAG_HEAP | FLAG_HAS_DROP,
+                payload_size: std::mem::size_of::<MpRtGpuErrorPayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuErrorPayload>() as u64,
+                drop_fn: Some(mp_rt_gpu_error_drop),
+                debug_fqn: c"gpu.TError".as_ptr(),
+            },
+            MpRtTypeInfo {
                 type_id: TYPE_ID_GPU_KERNEL_RT,
                 flags: FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
                 payload_size: std::mem::size_of::<MpRtGpuKernelPayload>() as u64,
                 payload_align: std::mem::align_of::<MpRtGpuKernelPayload>() as u64,
                 drop_fn: Some(mp_rt_gpu_kernel_drop),
                 debug_fqn: c"gpu.Kernel".as_ptr(),
+            },
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_PROFILE_SESSION,
+                flags: FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuProfileSessionPayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuProfileSessionPayload>() as u64,
+                drop_fn: Some(mp_rt_gpu_profile_session_drop),
+                debug_fqn: c"gpu.TProfileSession".as_ptr(),
+            },
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_PROFILE_EVENT,
+                flags: FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuProfileEventPayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuProfileEventPayload>() as u64,
+                drop_fn: Some(mp_rt_gpu_profile_event_drop),
+                debug_fqn: c"gpu.TProfileEvent".as_ptr(),
+            },
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_MEMORY_STATS,
+                flags: FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuMemoryStatsPayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuMemoryStatsPayload>() as u64,
+                drop_fn: None,
+                debug_fqn: c"gpu.TMemoryStats".as_ptr(),
             },
         ];
         mp_rt_register_types(infos.as_ptr(), infos.len() as u32);
@@ -2159,6 +2405,26 @@ unsafe fn gpu_kernel_payload(kernel: *mut MpRtHeader) -> *mut MpRtGpuKernelPaylo
 }
 
 #[inline]
+unsafe fn gpu_error_payload(err: *mut MpRtHeader) -> *mut MpRtGpuErrorPayload {
+    str_payload_base(err) as *mut MpRtGpuErrorPayload
+}
+
+#[inline]
+unsafe fn profile_session_payload(session: *mut MpRtHeader) -> *mut MpRtGpuProfileSessionPayload {
+    str_payload_base(session) as *mut MpRtGpuProfileSessionPayload
+}
+
+#[inline]
+unsafe fn profile_event_payload(event: *mut MpRtHeader) -> *mut MpRtGpuProfileEventPayload {
+    str_payload_base(event) as *mut MpRtGpuProfileEventPayload
+}
+
+#[inline]
+unsafe fn gpu_memory_stats_payload(stats: *mut MpRtHeader) -> *mut MpRtGpuMemoryStatsPayload {
+    str_payload_base(stats) as *mut MpRtGpuMemoryStatsPayload
+}
+
+#[inline]
 unsafe fn gpu_is_device(dev: *mut MpRtHeader) -> bool {
     !dev.is_null() && (*dev).type_id == TYPE_ID_GPU_DEVICE_RT
 }
@@ -2176,6 +2442,16 @@ unsafe fn gpu_is_fence(fence: *mut MpRtHeader) -> bool {
 #[inline]
 unsafe fn gpu_is_kernel(kernel: *mut MpRtHeader) -> bool {
     !kernel.is_null() && (*kernel).type_id == TYPE_ID_GPU_KERNEL_RT
+}
+
+#[inline]
+unsafe fn gpu_is_profile_session(session: *mut MpRtHeader) -> bool {
+    !session.is_null() && (*session).type_id == TYPE_ID_GPU_PROFILE_SESSION
+}
+
+#[inline]
+unsafe fn gpu_is_profile_event(event: *mut MpRtHeader) -> bool {
+    !event.is_null() && (*event).type_id == TYPE_ID_GPU_PROFILE_EVENT
 }
 
 unsafe fn gpu_new_device(index: u32) -> *mut MpRtHeader {
@@ -2198,10 +2474,10 @@ unsafe fn gpu_new_buffer(
     len: u64,
 ) -> Result<*mut MpRtHeader, String> {
     ensure_gpu_types_registered();
-    let total_bytes = len
+    let total_bytes_u64 = len
         .checked_mul(elem_size)
         .ok_or_else(|| "gpu buffer byte length overflow".to_string())?;
-    let total_bytes = usize::try_from(total_bytes)
+    let total_bytes = usize::try_from(total_bytes_u64)
         .map_err(|_| "gpu buffer byte length does not fit host usize".to_string())?;
 
     let obj = alloc_builtin(
@@ -2216,6 +2492,7 @@ unsafe fn gpu_new_buffer(
     (*payload).elem_size = elem_size;
     (*payload).len = len;
     std::ptr::write((*payload).bytes.get(), vec![0_u8; total_bytes]);
+    gpu_record_alloc(total_bytes_u64);
     Ok(obj)
 }
 
@@ -2258,13 +2535,287 @@ unsafe fn gpu_new_kernel(blob: &[u8]) -> *mut MpRtHeader {
     obj
 }
 
+unsafe fn gpu_new_error(kind: i32, backend: &str, message: &str, code: i32) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_ERROR,
+        FLAG_HEAP | FLAG_HAS_DROP,
+        std::mem::size_of::<MpRtGpuErrorPayload>(),
+        std::mem::align_of::<MpRtGpuErrorPayload>(),
+    );
+    let payload = gpu_error_payload(obj);
+    (*payload).kind = kind;
+    (*payload).backend = mp_rt_str_from_utf8(backend.as_ptr(), backend.len() as u64);
+    (*payload).message = mp_rt_str_from_utf8(message.as_ptr(), message.len() as u64);
+    (*payload).code = code;
+    obj
+}
+
+unsafe fn gpu_new_profile_session(dev: *mut MpRtHeader) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_PROFILE_SESSION,
+        FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuProfileSessionPayload>(),
+        std::mem::align_of::<MpRtGpuProfileSessionPayload>(),
+    );
+    let payload = profile_session_payload(obj);
+    (*payload).device = dev;
+    if !dev.is_null() {
+        mp_rt_retain_strong(dev);
+    }
+    std::ptr::write(&mut (*payload).events, Vec::new());
+    std::ptr::write(&mut (*payload).counters_enabled, Vec::new());
+    (*payload).start_time_ns = gpu_now_ns();
+    obj
+}
+
+unsafe fn gpu_profile_metadata_to_map(metadata: &[(String, String)]) -> *mut MpRtHeader {
+    if metadata.is_empty() {
+        return std::ptr::null_mut();
+    }
+
+    let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+    let map = mp_rt_map_new(
+        TYPE_ID_STR,
+        TYPE_ID_STR,
+        ptr_size,
+        ptr_size,
+        metadata.len() as u64,
+        None,
+        None,
+    );
+    for (key, value) in metadata {
+        let key_obj = mp_rt_str_from_utf8(key.as_ptr(), key.len() as u64);
+        let value_obj = mp_rt_str_from_utf8(value.as_ptr(), value.len() as u64);
+        mp_rt_map_set(
+            map,
+            &key_obj as *const *mut MpRtHeader as *const u8,
+            ptr_size,
+            &value_obj as *const *mut MpRtHeader as *const u8,
+            ptr_size,
+        );
+    }
+    map
+}
+
+unsafe fn gpu_new_profile_event(event: &MpRtGpuProfileEventData) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_PROFILE_EVENT,
+        FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuProfileEventPayload>(),
+        std::mem::align_of::<MpRtGpuProfileEventPayload>(),
+    );
+    let payload = profile_event_payload(obj);
+    (*payload).name = mp_rt_str_from_utf8(event.name.as_ptr(), event.name.len() as u64);
+    (*payload).start_ns = event.start_ns;
+    (*payload).end_ns = if event.end_ns >= event.start_ns {
+        event.end_ns
+    } else {
+        event.start_ns
+    };
+    (*payload).metadata = gpu_profile_metadata_to_map(&event.metadata);
+    obj
+}
+
+unsafe fn gpu_new_memory_stats(dev: *mut MpRtHeader) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_MEMORY_STATS,
+        FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuMemoryStatsPayload>(),
+        std::mem::align_of::<MpRtGpuMemoryStatsPayload>(),
+    );
+    let payload = gpu_memory_stats_payload(obj);
+    (*payload).allocated_bytes = GPU_ALLOC_BYTES.load(Ordering::Relaxed);
+    (*payload).peak_allocated_bytes = GPU_ALLOC_PEAK.load(Ordering::Relaxed);
+    (*payload).num_allocations = GPU_ALLOC_COUNT.load(Ordering::Relaxed);
+    (*payload).num_frees = GPU_FREE_COUNT.load(Ordering::Relaxed);
+    (*payload).device_total_bytes = mp_rt_gpu_device_memory_total(dev);
+    (*payload).device_available_bytes = mp_rt_gpu_device_memory_available(dev);
+    obj
+}
+
+unsafe fn gpu_set_structured_error(
+    out_err: *mut *mut MpRtHeader,
+    kind: i32,
+    backend: &str,
+    message: &str,
+    code: i32,
+) {
+    let err = gpu_new_error(kind, backend, message, code);
+    if out_err.is_null() {
+        mp_rt_release_strong(err);
+    } else {
+        *out_err = err;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_error_new(
+    kind: i32,
+    backend: *const i8,
+    message: *const i8,
+    code: i32,
+) -> *mut MpRtHeader {
+    let backend_text = if backend.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(backend as *const c_char)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let message_text = if message.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(message as *const c_char)
+            .to_string_lossy()
+            .into_owned()
+    };
+    gpu_new_error(kind, &backend_text, &message_text, code)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_error_drop(obj: *mut MpRtHeader) {
+    mp_rt_gpu_error_drop_impl(obj);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_error_kind(err: *mut MpRtHeader) -> i32 {
+    if err.is_null() || (*err).type_id != TYPE_ID_GPU_ERROR {
+        return -1;
+    }
+    (*gpu_error_payload(err)).kind
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_error_message(err: *mut MpRtHeader) -> *mut MpRtHeader {
+    if err.is_null() || (*err).type_id != TYPE_ID_GPU_ERROR {
+        return std::ptr::null_mut();
+    }
+    let msg = (*gpu_error_payload(err)).message;
+    if !msg.is_null() {
+        mp_rt_retain_strong(msg);
+    }
+    msg
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_error_backend(err: *mut MpRtHeader) -> *mut MpRtHeader {
+    if err.is_null() || (*err).type_id != TYPE_ID_GPU_ERROR {
+        return std::ptr::null_mut();
+    }
+    let backend = (*gpu_error_payload(err)).backend;
+    if !backend.is_null() {
+        mp_rt_retain_strong(backend);
+    }
+    backend
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_error_code(err: *mut MpRtHeader) -> i32 {
+    if err.is_null() || (*err).type_id != TYPE_ID_GPU_ERROR {
+        return 0;
+    }
+    (*gpu_error_payload(err)).code
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_init() {
+    {
+        let dispatch = gpu_dispatch().read().unwrap();
+        if dispatch.is_some() {
+            return;
+        }
+    }
+
+    // Try backends in priority order: Metal > CUDA > HIP > Vulkan > WebGPU
+    let candidates: &[(&str, &[u8])] = &[
+        #[cfg(target_os = "macos")]
+        (
+            "metal",
+            b"/System/Library/Frameworks/Metal.framework/Metal\0",
+        ),
+        (
+            "cuda",
+            if cfg!(target_os = "linux") {
+                b"libcuda.so.1\0"
+            } else {
+                b"nvcuda.dll\0"
+            },
+        ),
+        ("hip", b"libamdhip64.so\0"),
+        (
+            "vulkan",
+            if cfg!(target_os = "macos") {
+                b"libvulkan.dylib\0"
+            } else if cfg!(target_os = "linux") {
+                b"libvulkan.so.1\0"
+            } else {
+                b"vulkan-1.dll\0"
+            },
+        ),
+        (
+            "wgpu",
+            if cfg!(target_os = "macos") {
+                b"libwgpu_native.dylib\0"
+            } else {
+                b"libwgpu_native.so\0"
+            },
+        ),
+    ];
+
+    for (name, lib_path) in candidates {
+        let handle = libc_dlopen(lib_path.as_ptr() as *const i8);
+        if !handle.is_null() {
+            let table = GpuDispatchTable {
+                backend_name: name,
+                lib_handle: handle,
+                create_device: None,
+                destroy_device: None,
+                alloc_buffer: None,
+                free_buffer: None,
+                launch_kernel: None,
+            };
+            *gpu_dispatch().write().unwrap() = Some(table);
+            return;
+        }
+    }
+    // No GPU backend available - CPU fallback remains active
+}
+
+#[cfg(unix)]
+unsafe fn libc_dlopen(path: *const i8) -> *mut std::ffi::c_void {
+    unsafe extern "C" {
+        fn dlopen(filename: *const i8, flags: i32) -> *mut std::ffi::c_void;
+    }
+    unsafe { dlopen(path, 1) } // RTLD_LAZY = 1
+}
+
+#[cfg(not(unix))]
+unsafe fn libc_dlopen(_path: *const i8) -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
 #[no_mangle]
 pub extern "C" fn mp_rt_gpu_device_count() -> u32 {
+    unsafe {
+        mp_rt_gpu_init();
+    }
     1
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_register_kernels(entries: *const u8, count: i32) {
+pub unsafe extern "C" fn mp_rt_gpu_device_count_unified() -> u32 {
+    mp_rt_gpu_device_count()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_register_kernels(
+    entries: *const MpRtGpuKernelEntry,
+    count: i32,
+) {
     let mut registry = gpu_kernel_registry().write().unwrap();
     registry.clear();
 
@@ -2273,13 +2824,16 @@ pub unsafe extern "C" fn mp_rt_gpu_register_kernels(entries: *const u8, count: i
         return;
     }
 
-    let entries = std::slice::from_raw_parts(entries as *const MpRtGpuKernelEntry, count as usize);
+    let entries = std::slice::from_raw_parts(entries, count as usize);
     for entry in entries {
+        let Some(blob) = gpu_select_blob(entry) else {
+            continue;
+        };
         registry.insert(
             entry.sid_hash,
             GpuKernelMeta {
-                num_buffers: entry.num_buffers,
-                push_const_size: entry.push_const_size,
+                num_buffers: blob.num_buffers,
+                push_const_size: blob.push_const_size,
             },
         );
     }
@@ -2293,6 +2847,7 @@ pub unsafe extern "C" fn mp_rt_gpu_device_default(
 ) -> i32 {
     gpu_clear_handle(out_dev);
     gpu_clear_handle(out_errmsg);
+    mp_rt_gpu_init();
     if out_dev.is_null() {
         gpu_set_error(out_errmsg, "out_dev must not be null");
         return -1;
@@ -2302,19 +2857,65 @@ pub unsafe extern "C" fn mp_rt_gpu_device_default(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_default_unified(
+    out_dev: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_dev);
+    gpu_clear_handle(out_err);
+
+    let mut legacy_err: *mut MpRtHeader = std::ptr::null_mut();
+    let rc = mp_rt_gpu_device_default(out_dev, &mut legacy_err);
+    if rc == 0 {
+        if !legacy_err.is_null() {
+            mp_rt_release_strong(legacy_err);
+        }
+        return 0;
+    }
+
+    let message =
+        str_obj_to_string(legacy_err).unwrap_or_else(|| "gpu device default failed".to_string());
+    if !legacy_err.is_null() {
+        mp_rt_release_strong(legacy_err);
+    }
+    gpu_set_structured_error(
+        out_err,
+        GPU_ERROR_BACKEND_UNAVAILABLE,
+        gpu_backend_name_or_fallback(),
+        &message,
+        rc,
+    );
+    -1
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn mp_rt_gpu_device_by_index(
     idx: u32,
     out_dev: *mut *mut MpRtHeader,
-    out_errmsg: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
 ) -> i32 {
     gpu_clear_handle(out_dev);
-    gpu_clear_handle(out_errmsg);
+    gpu_clear_handle(out_err);
+    mp_rt_gpu_init();
     if out_dev.is_null() {
-        gpu_set_error(out_errmsg, "out_dev must not be null");
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "out_dev must not be null",
+            -1,
+        );
         return -1;
     }
     if idx != 0 {
-        gpu_set_error(out_errmsg, &format!("gpu device index out of range: {idx}"));
+        let code = i32::try_from(idx).unwrap_or(i32::MAX);
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_UNSUPPORTED,
+            gpu_backend_name_or_fallback(),
+            &format!("gpu device index out of range: {idx}"),
+            code,
+        );
         return -1;
     }
     *out_dev = gpu_new_device(idx);
@@ -2324,11 +2925,506 @@ pub unsafe extern "C" fn mp_rt_gpu_device_by_index(
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_gpu_device_name(dev: *mut MpRtHeader) -> *mut MpRtHeader {
     let label = if gpu_is_device(dev) {
-        "cpu-fallback-gpu:0"
+        match gpu_backend_name() {
+            Some(backend_name) => format!("{backend_name}-gpu:0"),
+            None => "cpu-fallback-gpu:0".to_string(),
+        }
     } else {
-        "invalid-gpu-device"
+        "invalid-gpu-device".to_string()
     };
     mp_rt_str_from_utf8(label.as_ptr(), label.len() as u64)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_backends(
+    dev: *mut MpRtHeader,
+    out_arr: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_arr);
+    gpu_clear_handle(out_err);
+    if out_arr.is_null() {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "out_arr must not be null",
+            -1,
+        );
+        return -1;
+    }
+    if !gpu_is_device(dev) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu device handle",
+            -1,
+        );
+        return -1;
+    }
+
+    let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+    let arr = mp_rt_arr_new(TYPE_ID_STR, ptr_size, 0);
+    let backend = gpu_backend_name_or_fallback();
+    let backend_obj = mp_rt_str_from_utf8(backend.as_ptr(), backend.len() as u64);
+    mp_rt_arr_push(
+        arr,
+        &backend_obj as *const *mut MpRtHeader as *const u8,
+        ptr_size,
+    );
+    *out_arr = arr;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_max_workgroup_size(dev: *mut MpRtHeader) -> u32 {
+    if !gpu_is_device(dev) {
+        return 0;
+    }
+    match gpu_backend_name() {
+        Some("wgpu") => 256,
+        _ => 1024,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_max_shared_bytes(_dev: *mut MpRtHeader) -> u32 {
+    49_152
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_max_buffers(_dev: *mut MpRtHeader) -> u32 {
+    16
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_warp_size(dev: *mut MpRtHeader) -> u32 {
+    if !gpu_is_device(dev) {
+        return 0;
+    }
+    match gpu_backend_name() {
+        Some("hip") => 64,   // AMD wavefront
+        Some("cuda") => 32,  // NVIDIA warp
+        Some("metal") => 32, // Apple SIMD-group size
+        _ => 32,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_memory_total(_dev: *mut MpRtHeader) -> u64 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_memory_available(_dev: *mut MpRtHeader) -> u64 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_begin(
+    dev: *mut MpRtHeader,
+    out_session: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_session);
+    gpu_clear_handle(out_err);
+    if out_session.is_null() {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "out_session must not be null",
+            -1,
+        );
+        return -1;
+    }
+    if !gpu_is_device(dev) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu device handle",
+            -1,
+        );
+        return -1;
+    }
+
+    *out_session = gpu_new_profile_session(dev);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_end(
+    session: *mut MpRtHeader,
+    out_events: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_events);
+    gpu_clear_handle(out_err);
+    if out_events.is_null() {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "out_events must not be null",
+            -1,
+        );
+        return -1;
+    }
+    if !gpu_is_profile_session(session) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu profile session handle",
+            -1,
+        );
+        return -1;
+    }
+
+    let payload = profile_session_payload(session);
+    let events_ref = &(*payload).events;
+    let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+    let out = mp_rt_arr_new(
+        TYPE_ID_GPU_PROFILE_EVENT,
+        ptr_size,
+        u64::try_from(events_ref.len()).unwrap_or(u64::MAX),
+    );
+    for event in events_ref {
+        let event_obj = gpu_new_profile_event(event);
+        mp_rt_arr_push(
+            out,
+            &event_obj as *const *mut MpRtHeader as *const u8,
+            ptr_size,
+        );
+    }
+    *out_events = out;
+
+    mp_rt_release_strong(session);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_mark_begin(
+    session: *mut MpRtHeader,
+    name: *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_err);
+    if !gpu_is_profile_session(session) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu profile session handle",
+            -1,
+        );
+        return -1;
+    }
+    let Some(name_text) = str_obj_to_string(name) else {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "profile event name must be a Str",
+            -1,
+        );
+        return -1;
+    };
+
+    let payload = profile_session_payload(session);
+    (*payload).events.push(MpRtGpuProfileEventData {
+        name: name_text,
+        start_ns: gpu_now_ns(),
+        end_ns: 0,
+        metadata: Vec::new(),
+    });
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_mark_end(
+    session: *mut MpRtHeader,
+    name: *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_err);
+    if !gpu_is_profile_session(session) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu profile session handle",
+            -1,
+        );
+        return -1;
+    }
+    let Some(name_text) = str_obj_to_string(name) else {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "profile event name must be a Str",
+            -1,
+        );
+        return -1;
+    };
+
+    let payload = profile_session_payload(session);
+    let events = &mut (*payload).events;
+    let now = gpu_now_ns();
+    for event in events.iter_mut().rev() {
+        if event.name == name_text && event.end_ns == 0 {
+            event.end_ns = now;
+            return 0;
+        }
+    }
+
+    gpu_set_structured_error(
+        out_err,
+        GPU_ERROR_VALIDATION_FAILED,
+        gpu_backend_name_or_fallback(),
+        "profile mark_end called without matching mark_begin",
+        -1,
+    );
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_export_chrome(
+    events: *mut MpRtHeader,
+    path: *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_err);
+    if events.is_null() || (*events).type_id != TYPE_ID_ARRAY {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "events must be an Array<gpu.TProfileEvent>",
+            -1,
+        );
+        return -1;
+    }
+    let Some(path_text) = str_obj_to_string(path) else {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "path must be a Str",
+            -1,
+        );
+        return -1;
+    };
+
+    let payload = arr_payload(events);
+    let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+    if (*payload).elem_type_id != TYPE_ID_GPU_PROFILE_EVENT || (*payload).elem_size != ptr_size {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "events must be an Array<gpu.TProfileEvent>",
+            -1,
+        );
+        return -1;
+    }
+
+    let mut json = String::from("{\"traceEvents\":[");
+    for idx in 0..(*payload).len {
+        let event = *(mp_rt_arr_get(events, idx) as *const *mut MpRtHeader);
+        if !gpu_is_profile_event(event) {
+            gpu_set_structured_error(
+                out_err,
+                GPU_ERROR_VALIDATION_FAILED,
+                gpu_backend_name_or_fallback(),
+                "events array contains an invalid profile event",
+                -1,
+            );
+            return -1;
+        }
+        let event_payload = profile_event_payload(event);
+        let name = str_obj_to_string((*event_payload).name).unwrap_or_default();
+        let start = (*event_payload).start_ns;
+        let dur = (*event_payload).end_ns.saturating_sub(start);
+        if idx != 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"cat\":\"gpu\",\"ph\":\"X\",\"ts\":{},\"dur\":{},\"pid\":0,\"tid\":0}}",
+            json_escape_str(&name),
+            start,
+            dur
+        ));
+    }
+    json.push_str("]}");
+
+    if let Err(err) = std::fs::write(&path_text, json) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_DRIVER_ERROR,
+            gpu_backend_name_or_fallback(),
+            &format!("failed to write chrome trace: {err}"),
+            -1,
+        );
+        return -1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_available_counters(
+    dev: *mut MpRtHeader,
+    out_arr: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_arr);
+    if out_arr.is_null() || !gpu_is_device(dev) {
+        return -1;
+    }
+    *out_arr = mp_rt_arr_new(
+        TYPE_ID_STR,
+        std::mem::size_of::<*mut MpRtHeader>() as u64,
+        0,
+    );
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_enable_counters(
+    session: *mut MpRtHeader,
+    counters: *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_err);
+    if !gpu_is_profile_session(session) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu profile session handle",
+            -1,
+        );
+        return -1;
+    }
+    if counters.is_null() || (*counters).type_id != TYPE_ID_ARRAY {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "counters must be an Array<Str>",
+            -1,
+        );
+        return -1;
+    }
+
+    let counters_payload = arr_payload(counters);
+    let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+    if (*counters_payload).elem_type_id != TYPE_ID_STR || (*counters_payload).elem_size != ptr_size
+    {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "counters must be an Array<Str>",
+            -1,
+        );
+        return -1;
+    }
+
+    let session_payload = profile_session_payload(session);
+    let enabled = &mut (*session_payload).counters_enabled;
+    enabled.clear();
+    for idx in 0..(*counters_payload).len {
+        let name_obj = *(mp_rt_arr_get(counters, idx) as *const *mut MpRtHeader);
+        let Some(name_text) = str_obj_to_string(name_obj) else {
+            gpu_set_structured_error(
+                out_err,
+                GPU_ERROR_VALIDATION_FAILED,
+                gpu_backend_name_or_fallback(),
+                "counters array contains a non-Str value",
+                -1,
+            );
+            return -1;
+        };
+        enabled.push(name_text);
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_read_counters(
+    session: *mut MpRtHeader,
+    out_map: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_map);
+    gpu_clear_handle(out_err);
+    if out_map.is_null() {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "out_map must not be null",
+            -1,
+        );
+        return -1;
+    }
+    if !gpu_is_profile_session(session) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu profile session handle",
+            -1,
+        );
+        return -1;
+    }
+
+    *out_map = mp_rt_map_new(
+        TYPE_ID_STR,
+        TYPE_ID_F64,
+        std::mem::size_of::<*mut MpRtHeader>() as u64,
+        std::mem::size_of::<f64>() as u64,
+        0,
+        None,
+        None,
+    );
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_profile_memory_stats(
+    dev: *mut MpRtHeader,
+    out_stats: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_stats);
+    gpu_clear_handle(out_err);
+    if out_stats.is_null() {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "out_stats must not be null",
+            -1,
+        );
+        return -1;
+    }
+    if !gpu_is_device(dev) {
+        gpu_set_structured_error(
+            out_err,
+            GPU_ERROR_VALIDATION_FAILED,
+            gpu_backend_name_or_fallback(),
+            "invalid gpu device handle",
+            -1,
+        );
+        return -1;
+    }
+
+    *out_stats = gpu_new_memory_stats(dev);
+    0
 }
 
 #[no_mangle]
@@ -2361,6 +3457,29 @@ pub unsafe extern "C" fn mp_rt_gpu_buffer_new(
             -1
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_new_hinted(
+    dev: *mut MpRtHeader,
+    elem_type_id: u32,
+    elem_size: u32,
+    len: u64,
+    usage_flags: u32,
+    hint: u32,
+    out_buf: *mut *mut MpRtHeader,
+    out_err: *mut *mut MpRtHeader,
+) -> i32 {
+    let _ = hint;
+    mp_rt_gpu_buffer_new(
+        dev,
+        elem_type_id,
+        u64::from(elem_size),
+        len,
+        usage_flags,
+        out_buf,
+        out_err,
+    )
 }
 
 #[no_mangle]
@@ -2489,16 +3608,45 @@ pub unsafe extern "C" fn mp_rt_gpu_device_sync(
     0
 }
 
+unsafe fn gpu_validate_dispatch_dims(
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> bool {
+    if grid_x == 0 || grid_y == 0 || grid_z == 0 {
+        gpu_set_error(out_errmsg, "grid dimensions must be greater than zero");
+        return false;
+    }
+    if block_x == 0 || block_y == 0 || block_z == 0 {
+        gpu_set_error(out_errmsg, "block dimensions must be greater than zero");
+        return false;
+    }
+
+    let threads_per_block = u64::from(block_x)
+        .saturating_mul(u64::from(block_y))
+        .saturating_mul(u64::from(block_z));
+    if threads_per_block > 1024 {
+        gpu_set_error(out_errmsg, "threads per block exceed runtime limit (1024)");
+        return false;
+    }
+
+    true
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_gpu_launch_sync(
     dev: *mut MpRtHeader,
     kernel_sid_hash: u64,
-    _grid_x: u32,
-    _grid_y: u32,
-    _grid_z: u32,
-    _block_x: u32,
-    _block_y: u32,
-    _block_z: u32,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
     args_blob: *const u8,
     args_len: u64,
     out_errmsg: *mut *mut MpRtHeader,
@@ -2506,6 +3654,11 @@ pub unsafe extern "C" fn mp_rt_gpu_launch_sync(
     gpu_clear_handle(out_errmsg);
     if !gpu_is_device(dev) {
         gpu_set_error(out_errmsg, "invalid gpu device handle");
+        return -1;
+    }
+    if !gpu_validate_dispatch_dims(
+        grid_x, grid_y, grid_z, block_x, block_y, block_z, out_errmsg,
+    ) {
         return -1;
     }
     let Some(meta) = gpu_kernel_registry()
@@ -2558,12 +3711,12 @@ pub unsafe extern "C" fn mp_rt_gpu_launch_sync(
 pub unsafe extern "C" fn mp_rt_gpu_launch_async(
     dev: *mut MpRtHeader,
     kernel_sid_hash: u64,
-    _grid_x: u32,
-    _grid_y: u32,
-    _grid_z: u32,
-    _block_x: u32,
-    _block_y: u32,
-    _block_z: u32,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
     args_blob: *const u8,
     args_len: u64,
     out_fence: *mut *mut MpRtHeader,
@@ -2578,12 +3731,12 @@ pub unsafe extern "C" fn mp_rt_gpu_launch_async(
     let sync = mp_rt_gpu_launch_sync(
         dev,
         kernel_sid_hash,
-        _grid_x,
-        _grid_y,
-        _grid_z,
-        _block_x,
-        _block_y,
-        _block_z,
+        grid_x,
+        grid_y,
+        grid_z,
+        block_x,
+        block_y,
+        block_z,
         args_blob,
         args_len,
         out_errmsg,
@@ -3020,8 +4173,7 @@ mod tests {
                 offset_or_binding: 0,
                 size: 0,
             }];
-            let entries = [MpRtGpuKernelEntry {
-                sid_hash: 42,
+            let blobs = [MpRtGpuKernelBlob {
                 backend: 1,
                 blob: std::ptr::null(),
                 blob_len: 0,
@@ -3030,7 +4182,13 @@ mod tests {
                 num_buffers: 1,
                 push_const_size: 16,
             }];
-            mp_rt_gpu_register_kernels(entries.as_ptr().cast::<u8>(), entries.len() as i32);
+            let entries = [MpRtGpuKernelEntry {
+                sid_hash: 42,
+                num_blobs: blobs.len() as u32,
+                _reserved: 0,
+                blobs: blobs.as_ptr(),
+            }];
+            mp_rt_gpu_register_kernels(entries.as_ptr(), entries.len() as i32);
             assert_eq!(GPU_REGISTERED_KERNEL_COUNT.load(Ordering::Relaxed), 1);
 
             let compat_dev = mp_rt_gpu_device_open(0);
@@ -3048,7 +4206,11 @@ mod tests {
             assert_eq!(mp_rt_gpu_device_by_index(1, &mut bad_dev, &mut gpu_err), -1);
             assert!(bad_dev.is_null());
             assert!(!gpu_err.is_null());
-            assert!(read_str(gpu_err).contains("out of range"));
+            // gpu_err is now a gpu.TError, not a Str — use accessor
+            let err_msg = mp_rt_gpu_error_message(gpu_err);
+            assert!(!err_msg.is_null());
+            assert!(read_str(err_msg).contains("out of range"));
+            mp_rt_release_strong(err_msg);
             mp_rt_release_strong(gpu_err);
 
             let mut dev2: *mut MpRtHeader = std::ptr::null_mut();
@@ -3063,8 +4225,32 @@ mod tests {
             mp_rt_release_strong(dev_name);
 
             let dev_name_ok = mp_rt_gpu_device_name(dev);
-            assert_eq!(read_str(dev_name_ok), "cpu-fallback-gpu:0");
+            let name = read_str(dev_name_ok);
+            assert!(
+                name.ends_with("-gpu:0"),
+                "expected device name ending with '-gpu:0', got '{name}'"
+            );
             mp_rt_release_strong(dev_name_ok);
+
+            let mut backends_arr: *mut MpRtHeader = std::ptr::null_mut();
+            let mut backend_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_device_backends(dev, &mut backends_arr, &mut backend_err),
+                0
+            );
+            assert!(!backends_arr.is_null());
+            assert!(backend_err.is_null());
+            assert_eq!(mp_rt_arr_len(backends_arr), 1);
+            let backend_name = *(mp_rt_arr_get(backends_arr, 0) as *const *mut MpRtHeader);
+            let backend_name_text = read_str(backend_name);
+            assert!(
+                matches!(
+                    backend_name_text.as_str(),
+                    "metal" | "cuda" | "hip" | "vulkan" | "wgpu" | "cpu-fallback"
+                ),
+                "unexpected backend name '{backend_name_text}'"
+            );
+            mp_rt_release_strong(backends_arr);
 
             let compat_buf = mp_rt_gpu_buffer_alloc(dev as *mut u8, 8);
             assert!(!compat_buf.is_null());
@@ -3296,8 +4482,7 @@ mod tests {
                 offset_or_binding: 0,
                 size: 0,
             }];
-            let entries = [MpRtGpuKernelEntry {
-                sid_hash: 77,
+            let blobs = [MpRtGpuKernelBlob {
                 backend: 1,
                 blob: std::ptr::null(),
                 blob_len: 0,
@@ -3306,7 +4491,13 @@ mod tests {
                 num_buffers: 1,
                 push_const_size: 0,
             }];
-            mp_rt_gpu_register_kernels(entries.as_ptr().cast::<u8>(), entries.len() as i32);
+            let entries = [MpRtGpuKernelEntry {
+                sid_hash: 77,
+                num_blobs: blobs.len() as u32,
+                _reserved: 0,
+                blobs: blobs.as_ptr(),
+            }];
+            mp_rt_gpu_register_kernels(entries.as_ptr(), entries.len() as i32);
 
             let mut dev: *mut MpRtHeader = std::ptr::null_mut();
             let mut err: *mut MpRtHeader = std::ptr::null_mut();
@@ -4013,10 +5204,23 @@ mod tests {
         assert!(header.contains("mp_rt_mutex_new("));
         assert!(header.contains("mp_rt_channel_new("));
         assert!(header.contains("mp_rt_web_serve("));
+        assert!(header.contains("typedef struct MpRtGpuParam"));
+        assert!(header.contains("typedef struct MpRtGpuKernelBlob"));
         assert!(header.contains("typedef struct MpRtGpuKernelEntry"));
+        assert!(header.contains("mp_rt_gpu_init("));
         assert!(header.contains("mp_rt_gpu_register_kernels("));
+        assert!(header.contains("mp_rt_gpu_error_new("));
+        assert!(header.contains("mp_rt_gpu_error_kind("));
+        assert!(header.contains("mp_rt_gpu_device_count_unified("));
+        assert!(header.contains("mp_rt_gpu_device_default_unified("));
+        assert!(header.contains("mp_rt_gpu_device_backends("));
+        assert!(header.contains("mp_rt_gpu_device_max_workgroup_size("));
+        assert!(header.contains("mp_rt_gpu_buffer_new_hinted("));
         assert!(header.contains("mp_rt_gpu_launch_sync("));
         assert!(header.contains("mp_rt_gpu_launch_async("));
+        assert!(header.contains("mp_rt_gpu_profile_begin("));
+        assert!(header.contains("mp_rt_gpu_profile_end("));
+        assert!(header.contains("mp_rt_gpu_profile_export_chrome("));
         assert!(header.contains("mp_rt_gpu_kernel_load("));
         assert!(header.contains("mp_std_hash_str("));
         assert!(header.contains("mp_std_block_on("));

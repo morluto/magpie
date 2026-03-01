@@ -186,6 +186,12 @@ impl<'a, 'd> Parser<'a, 'd> {
         let decl = match self.peek().kind {
             TokenKind::Fn => self.parse_fn_decl(start, doc, FnFlavor::Regular),
             TokenKind::Async => self.parse_fn_decl(start, doc, FnFlavor::Async),
+            TokenKind::Unsafe
+                if self.peek_n_kind(1) == TokenKind::Gpu
+                    && self.peek_n_kind(2) == TokenKind::Fn =>
+            {
+                self.parse_fn_decl(start, doc, FnFlavor::UnsafeGpu)
+            }
             TokenKind::Unsafe if self.peek_n_kind(1) == TokenKind::Fn => {
                 self.parse_fn_decl(start, doc, FnFlavor::Unsafe)
             }
@@ -245,6 +251,11 @@ impl<'a, 'd> Parser<'a, 'd> {
                 self.expect(TokenKind::Gpu);
                 self.expect(TokenKind::Fn);
             }
+            FnFlavor::UnsafeGpu => {
+                self.expect(TokenKind::Unsafe);
+                self.expect(TokenKind::Gpu);
+                self.expect(TokenKind::Fn);
+            }
         }
 
         let name = self
@@ -258,15 +269,57 @@ impl<'a, 'd> Parser<'a, 'd> {
         self.expect(TokenKind::Arrow);
         let ret_ty = self.parse_type();
 
-        let target = if matches!(flavor, FnFlavor::Gpu) {
-            self.expect(TokenKind::Target);
-            self.expect(TokenKind::LParen);
-            let target = self.parse_ident().unwrap_or_default();
-            self.expect(TokenKind::RParen);
-            Some(target)
-        } else {
-            None
-        };
+        let mut target = None;
+        let mut workgroup = None;
+        let mut requires = Vec::new();
+        let is_gpu = matches!(flavor, FnFlavor::Gpu | FnFlavor::UnsafeGpu);
+        if is_gpu {
+            while matches!(
+                self.peek().kind,
+                TokenKind::Target | TokenKind::Workgroup | TokenKind::Requires
+            ) {
+                match self.peek().kind {
+                    TokenKind::Target => {
+                        self.advance();
+                        self.expect(TokenKind::LParen);
+                        let parsed = self.parse_ident_or_keyword().unwrap_or_default();
+                        self.expect(TokenKind::RParen);
+                        target = Some(parsed);
+                    }
+                    TokenKind::Workgroup => {
+                        self.advance();
+                        self.expect(TokenKind::LParen);
+                        let x = self.parse_u32_annotation_lit().unwrap_or(0);
+                        self.expect(TokenKind::Comma);
+                        let y = self.parse_u32_annotation_lit().unwrap_or(0);
+                        self.expect(TokenKind::Comma);
+                        let z = self.parse_u32_annotation_lit().unwrap_or(0);
+                        self.expect(TokenKind::RParen);
+                        workgroup = Some([x, y, z]);
+                    }
+                    TokenKind::Requires => {
+                        self.advance();
+                        self.expect(TokenKind::LParen);
+                        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                            if let Some(cap) = self.parse_dotted_ident_or_keyword() {
+                                requires.push(cap);
+                            } else {
+                                self.advance();
+                            }
+                            if self.eat(TokenKind::Comma).is_none() {
+                                break;
+                            }
+                        }
+                        self.expect(TokenKind::RParen);
+                    }
+                    _ => break,
+                }
+            }
+
+            if target.is_none() {
+                self.error_here("`gpu fn` requires a `target(...)` annotation.");
+            }
+        }
 
         let meta = if self.at(TokenKind::Meta) {
             self.parse_fn_meta()
@@ -292,6 +345,16 @@ impl<'a, 'd> Parser<'a, 'd> {
             FnFlavor::Gpu => AstDecl::GpuFn(AstGpuFnDecl {
                 inner,
                 target: target.unwrap_or_default(),
+                is_unsafe: false,
+                workgroup,
+                requires,
+            }),
+            FnFlavor::UnsafeGpu => AstDecl::GpuFn(AstGpuFnDecl {
+                inner,
+                target: target.unwrap_or_default(),
+                is_unsafe: true,
+                workgroup,
+                requires,
             }),
         };
 
@@ -1765,8 +1828,16 @@ impl<'a, 'd> Parser<'a, 'd> {
 
     fn parse_base_type(&mut self) -> Option<AstBaseType> {
         match self.peek().kind {
-            TokenKind::Ident => {
-                let text = self.peek().text.clone();
+            TokenKind::Ident | TokenKind::Async | TokenKind::Unsafe | TokenKind::Gpu
+            | TokenKind::Target | TokenKind::Workgroup | TokenKind::Requires | TokenKind::Heap
+            | TokenKind::Value | TokenKind::Fn | TokenKind::Meta => {
+                let text = if self.at(TokenKind::Ident) {
+                    self.peek().text.clone()
+                } else {
+                    Self::keyword_as_ident(self.peek().kind)
+                        .unwrap_or_default()
+                        .to_string()
+                };
                 if is_prim_type(&text) {
                     self.advance();
                     return Some(AstBaseType::Prim(text));
@@ -1911,7 +1982,7 @@ impl<'a, 'd> Parser<'a, 'd> {
     }
 
     fn parse_named_type_from_ident_path(&mut self) -> Option<AstBaseType> {
-        let mut segments = vec![self.parse_ident()?];
+        let mut segments = vec![self.parse_ident_or_keyword()?];
 
         loop {
             if self.eat(TokenKind::Dot).is_none() {
@@ -1929,8 +2000,8 @@ impl<'a, 'd> Parser<'a, 'd> {
                 });
             }
 
-            if self.at(TokenKind::Ident) {
-                segments.push(self.advance().text);
+            if let Some(segment) = self.parse_ident_or_keyword() {
+                segments.push(segment);
                 continue;
             }
 
@@ -1944,20 +2015,20 @@ impl<'a, 'd> Parser<'a, 'd> {
             return Some((None, self.advance().text));
         }
 
-        if !self.at(TokenKind::Ident) {
+        if !self.at(TokenKind::Ident) && Self::keyword_as_ident(self.peek().kind).is_none() {
             self.error_here("Expected type reference.");
             return None;
         }
 
-        let mut segments = vec![self.advance().text];
+        let mut segments = vec![self.parse_ident_or_keyword()?];
         loop {
             self.expect(TokenKind::Dot);
             if self.at(TokenKind::TypeName) {
                 let name = self.advance().text;
                 return Some((Some(ModulePath { segments }), name));
             }
-            if self.at(TokenKind::Ident) {
-                segments.push(self.advance().text);
+            if let Some(segment) = self.parse_ident_or_keyword() {
+                segments.push(segment);
                 continue;
             }
             self.error_here("Expected module segment or type name.");
@@ -2191,6 +2262,8 @@ impl<'a, 'd> Parser<'a, 'd> {
                 let tok = self.advance();
                 let text = tok
                     .text
+                    .trim_end_matches("bf16")
+                    .trim_end_matches("f16")
                     .trim_end_matches("f32")
                     .trim_end_matches("f64")
                     .to_string();
@@ -2304,6 +2377,8 @@ impl<'a, 'd> Parser<'a, 'd> {
             TokenKind::Unsafe => Some("unsafe"),
             TokenKind::Gpu => Some("gpu"),
             TokenKind::Target => Some("target"),
+            TokenKind::Workgroup => Some("workgroup"),
+            TokenKind::Requires => Some("requires"),
             TokenKind::Heap => Some("heap"),
             TokenKind::Value => Some("value"),
             TokenKind::Fn => Some("fn"),
@@ -2318,6 +2393,15 @@ impl<'a, 'd> Parser<'a, 'd> {
             return None;
         }
         Some(self.advance().text)
+    }
+
+    fn parse_dotted_ident_or_keyword(&mut self) -> Option<String> {
+        let mut segments = Vec::new();
+        segments.push(self.parse_ident_or_keyword()?);
+        while self.eat(TokenKind::Dot).is_some() {
+            segments.push(self.parse_ident_or_keyword()?);
+        }
+        Some(segments.join("."))
     }
 
     fn parse_ssa_name(&mut self) -> Option<String> {
@@ -2377,6 +2461,17 @@ impl<'a, 'd> Parser<'a, 'd> {
                 0
             });
         Some(value)
+    }
+
+    fn parse_u32_annotation_lit(&mut self) -> Option<u32> {
+        let value = self.parse_i64_lit()?;
+        match u32::try_from(value) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                self.error_here("Expected u32 annotation literal.");
+                Some(0)
+            }
+        }
     }
 
     fn parse_block_label_num(&mut self) -> Option<u32> {
@@ -2738,6 +2833,7 @@ enum FnFlavor {
     Async,
     Unsafe,
     Gpu,
+    UnsafeGpu,
 }
 
 fn is_prim_type(name: &str) -> bool {
@@ -2755,6 +2851,7 @@ fn is_prim_type(name: &str) -> bool {
             | "u64"
             | "u128"
             | "f16"
+            | "bf16"
             | "f32"
             | "f64"
             | "bool"
@@ -2898,5 +2995,47 @@ mod tests {
     #[test]
     fn snapshot_arithmetic_parser_output() {
         insta::assert_snapshot!(canonical_fixture("../../tests/fixtures/arithmetic.mp"));
+    }
+
+    #[test]
+    fn parse_unsafe_gpu_fn_annotations() {
+        let source = r#"
+module test.gpu
+exports { @k }
+imports { }
+digest "0000000000000000"
+
+unsafe gpu fn @k(%buf: gpu.TBuffer<i32>, %n: u32) -> unit target(ptx) workgroup(256, 1, 1) requires(device_malloc, cuda.tensor) {
+bb0:
+  ret
+}
+"#;
+
+        let mut diag = DiagnosticBag::new(100);
+        let file_id = FileId(0);
+        let tokens = magpie_lex::lex(file_id, source, &mut diag);
+        assert!(
+            !diag.has_errors(),
+            "lexer diagnostics: {:?}",
+            diag.diagnostics
+        );
+
+        let ast = parse_file(&tokens, file_id, &mut diag)
+            .unwrap_or_else(|_| panic!("parse failed: {:?}", diag.diagnostics));
+        assert!(
+            !diag.has_errors(),
+            "parser diagnostics: {:?}",
+            diag.diagnostics
+        );
+        let AstDecl::GpuFn(gpu_fn) = &ast.decls[0].node else {
+            panic!("expected first decl to be gpu fn");
+        };
+        assert!(gpu_fn.is_unsafe);
+        assert_eq!(gpu_fn.target, "ptx");
+        assert_eq!(gpu_fn.workgroup, Some([256, 1, 1]));
+        assert_eq!(
+            gpu_fn.requires,
+            vec!["device_malloc".to_string(), "cuda.tensor".to_string()]
+        );
     }
 }

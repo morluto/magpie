@@ -15,6 +15,7 @@ const MP_RT_FLAG_HEAP: u32 = 0x1;
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CodegenOptions {
     pub shared_generics: bool,
+    pub gpu_cpu_fallback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +145,7 @@ impl<'a> LlvmTextCodegen<'a> {
     fn emit_declarations(&self, out: &mut String) -> Result<(), String> {
         let decls = [
             "declare void @mp_rt_init()",
+            "declare void @mp_rt_gpu_init()",
             "declare void @mp_gpu_register_all_kernels()",
             "declare ptr @mp_rt_alloc(i32, i64, i64, i32)",
             "declare void @mp_rt_register_types(ptr, i32)",
@@ -582,6 +584,7 @@ impl<'a> LlvmTextCodegen<'a> {
                 PrimType::I64 | PrimType::U64 => "i64".to_string(),
                 PrimType::I128 | PrimType::U128 => "i128".to_string(),
                 PrimType::F16 => "half".to_string(),
+                PrimType::Bf16 => "bfloat".to_string(),
                 PrimType::F32 => "float".to_string(),
                 PrimType::F64 => "double".to_string(),
                 PrimType::Unit => "void".to_string(),
@@ -632,7 +635,7 @@ impl<'a> LlvmTextCodegen<'a> {
                 PrimType::Unit => 0,
                 PrimType::I1 | PrimType::U1 | PrimType::Bool => 1,
                 PrimType::I8 | PrimType::U8 => 1,
-                PrimType::I16 | PrimType::U16 | PrimType::F16 => 2,
+                PrimType::I16 | PrimType::U16 | PrimType::F16 | PrimType::Bf16 => 2,
                 PrimType::I32 | PrimType::U32 | PrimType::F32 => 4,
                 PrimType::I64 | PrimType::U64 | PrimType::F64 => 8,
                 PrimType::I128 | PrimType::U128 => 16,
@@ -1809,11 +1812,11 @@ impl<'a> FnBuilder<'a> {
                     self.set_local(i.dst, i.ty, dst_ty, decoded);
                 }
             }
-            MpirOp::GpuThreadId
-            | MpirOp::GpuWorkgroupId
-            | MpirOp::GpuWorkgroupSize
-            | MpirOp::GpuGlobalId => {
-                self.assign_cast_int(i.dst, i.ty, "0".to_string(), "i32")?;
+            MpirOp::GpuThreadId { dim }
+            | MpirOp::GpuWorkgroupId { dim }
+            | MpirOp::GpuWorkgroupSize { dim }
+            | MpirOp::GpuGlobalId { dim } => {
+                self.assign_cast_int(i.dst, i.ty, dim.to_string(), "i32")?;
             }
             MpirOp::GpuBufferLen { buf } => {
                 let buf = self.ensure_ptr_value(buf)?;
@@ -1834,20 +1837,20 @@ impl<'a> FnBuilder<'a> {
             MpirOp::GpuLaunch {
                 device,
                 kernel,
-                groups,
-                threads,
+                grid,
+                block,
                 args,
             } => {
-                self.emit_gpu_launch(i.dst, i.ty, device, kernel, groups, threads, args, false)?;
+                self.emit_gpu_launch(i.dst, i.ty, device, kernel, grid, block, args, false)?;
             }
             MpirOp::GpuLaunchAsync {
                 device,
                 kernel,
-                groups,
-                threads,
+                grid,
+                block,
                 args,
             } => {
-                self.emit_gpu_launch(i.dst, i.ty, device, kernel, groups, threads, args, true)?;
+                self.emit_gpu_launch(i.dst, i.ty, device, kernel, grid, block, args, true)?;
             }
             MpirOp::StrBuilderNew => {
                 writeln!(self.out, "  {dst} = call ptr @mp_rt_strbuilder_new()")
@@ -3405,14 +3408,21 @@ impl<'a> FnBuilder<'a> {
         dst_ty_id: TypeId,
         device: &MpirValue,
         kernel: &Sid,
-        groups: &MpirValue,
-        threads: &MpirValue,
+        grid: &[MpirValue; 3],
+        block: &[MpirValue; 3],
         args: &[MpirValue],
         is_async: bool,
     ) -> Result<(), String> {
+        if self.cg.options.gpu_cpu_fallback {
+            writeln!(self.out, "  call void @mp_rt_gpu_init()").map_err(|e| e.to_string())?;
+        }
         let device = self.ensure_ptr_value(device)?;
-        let groups = self.cast_i32_value(groups)?;
-        let threads = self.cast_i32_value(threads)?;
+        let grid_x = self.cast_i32_value(&grid[0])?;
+        let grid_y = self.cast_i32_value(&grid[1])?;
+        let grid_z = self.cast_i32_value(&grid[2])?;
+        let block_x = self.cast_i32_value(&block[0])?;
+        let block_y = self.cast_i32_value(&block[1])?;
+        let block_z = self.cast_i32_value(&block[2])?;
         let (args_blob, args_len) = self.build_gpu_launch_args_blob(kernel, args)?;
 
         let err_slot = self.tmp();
@@ -3428,7 +3438,7 @@ impl<'a> FnBuilder<'a> {
             writeln!(self.out, "  store ptr null, ptr {fence_slot}").map_err(|e| e.to_string())?;
             writeln!(
                 self.out,
-                "  {status} = call i32 @mp_rt_gpu_launch_async(ptr {device}, i64 {sid_hash}, i32 {groups}, i32 1, i32 1, i32 {threads}, i32 1, i32 1, ptr {args_blob}, i64 {args_len}, ptr {fence_slot}, ptr {err_slot})"
+                "  {status} = call i32 @mp_rt_gpu_launch_async(ptr {device}, i64 {sid_hash}, i32 {grid_x}, i32 {grid_y}, i32 {grid_z}, i32 {block_x}, i32 {block_y}, i32 {block_z}, ptr {args_blob}, i64 {args_len}, ptr {fence_slot}, ptr {err_slot})"
             )
             .map_err(|e| e.to_string())?;
             let fence = self.tmp();
@@ -3440,7 +3450,7 @@ impl<'a> FnBuilder<'a> {
         } else {
             writeln!(
                 self.out,
-                "  {status} = call i32 @mp_rt_gpu_launch_sync(ptr {device}, i64 {sid_hash}, i32 {groups}, i32 1, i32 1, i32 {threads}, i32 1, i32 1, ptr {args_blob}, i64 {args_len}, ptr {err_slot})"
+                "  {status} = call i32 @mp_rt_gpu_launch_sync(ptr {device}, i64 {sid_hash}, i32 {grid_x}, i32 {grid_y}, i32 {grid_z}, i32 {block_x}, i32 {block_y}, i32 {block_z}, ptr {args_blob}, i64 {args_len}, ptr {err_slot})"
             )
             .map_err(|e| e.to_string())?;
             let err = self.tmp();
@@ -4847,6 +4857,7 @@ mod tests {
                     name: "retv".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -4894,6 +4905,7 @@ mod tests {
                     name: "retv".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -4907,6 +4919,7 @@ mod tests {
             &type_ctx,
             CodegenOptions {
                 shared_generics: true,
+                gpu_cpu_fallback: false,
             },
         )
         .expect("shared-generics codegen should pass");
@@ -4948,6 +4961,7 @@ mod tests {
                     name: "retv".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -4966,12 +4980,21 @@ mod tests {
     fn test_codegen_gpu_ops_lowering() {
         let mut type_ctx = TypeCtx::new();
         let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let u32_ty = type_ctx.lookup_by_prim(PrimType::U32);
         let i64_ty = type_ctx.lookup_by_prim(PrimType::I64);
         let unit_ty = type_ctx.lookup_by_prim(PrimType::Unit);
         let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
             to: fixed_type_ids::U8,
         });
         let kernel_sid = Sid("F:KERNELGPU0".to_string());
+        let launch_dim = MpirValue::Const(HirConst {
+            ty: u32_ty,
+            lit: HirConstLit::IntLit(1),
+        });
+        let unit_val = MpirValue::Const(HirConst {
+            ty: u32_ty,
+            lit: HirConstLit::IntLit(1),
+        });
 
         let kernel_fn = MpirFn {
             sid: kernel_sid.clone(),
@@ -4985,6 +5008,7 @@ mod tests {
                 name: "buf".to_string(),
             }],
             is_async: false,
+            gpu_meta: None,
         };
 
         let main_fn = MpirFn {
@@ -5029,14 +5053,8 @@ mod tests {
                         op: MpirOp::GpuLaunch {
                             device: MpirValue::Local(magpie_types::LocalId(0)),
                             kernel: kernel_sid.clone(),
-                            groups: MpirValue::Const(HirConst {
-                                ty: i32_ty,
-                                lit: HirConstLit::IntLit(1),
-                            }),
-                            threads: MpirValue::Const(HirConst {
-                                ty: i32_ty,
-                                lit: HirConstLit::IntLit(1),
-                            }),
+                            grid: [launch_dim.clone(), unit_val.clone(), unit_val.clone()],
+                            block: [launch_dim.clone(), unit_val.clone(), unit_val.clone()],
                             args: vec![MpirValue::Local(magpie_types::LocalId(0))],
                         },
                     },
@@ -5046,14 +5064,8 @@ mod tests {
                         op: MpirOp::GpuLaunchAsync {
                             device: MpirValue::Local(magpie_types::LocalId(0)),
                             kernel: kernel_sid,
-                            groups: MpirValue::Const(HirConst {
-                                ty: i32_ty,
-                                lit: HirConstLit::IntLit(1),
-                            }),
-                            threads: MpirValue::Const(HirConst {
-                                ty: i32_ty,
-                                lit: HirConstLit::IntLit(1),
-                            }),
+                            grid: [launch_dim.clone(), unit_val.clone(), unit_val.clone()],
+                            block: [launch_dim.clone(), unit_val.clone(), unit_val.clone()],
                             args: vec![MpirValue::Local(magpie_types::LocalId(0))],
                         },
                     },
@@ -5104,6 +5116,7 @@ mod tests {
                 },
             ],
             is_async: false,
+            gpu_meta: None,
         };
 
         let module = MpirModule {
@@ -5142,6 +5155,7 @@ mod tests {
                 blocks: vec![],
                 locals: vec![],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5192,6 +5206,7 @@ mod tests {
                     name: "sum".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5236,6 +5251,7 @@ mod tests {
                     name: "s".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5351,6 +5367,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5438,6 +5455,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5524,6 +5542,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5624,6 +5643,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5679,6 +5699,7 @@ mod tests {
                     name: "ret".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5843,6 +5864,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -5941,6 +5963,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -6066,6 +6089,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -6184,6 +6208,7 @@ mod tests {
                     },
                 ],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };

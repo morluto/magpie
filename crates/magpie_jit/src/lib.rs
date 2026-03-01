@@ -458,7 +458,13 @@ fn eval_source_to_artifacts(source: &str, diag: &mut DiagnosticBag) -> Result<Ev
         let llvm_ir = match codegen_module(&mpir_module, &type_ctx) {
             Ok(llvm_ir) => llvm_ir,
             Err(err) => {
-                emit_diag(diag, "MPG0001", Severity::Error, "llvm codegen failed", err);
+                emit_diag(
+                    diag,
+                    "MPG_CORE_1301",
+                    Severity::Error,
+                    "llvm codegen failed",
+                    err,
+                );
                 return Err(());
             }
         };

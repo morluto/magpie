@@ -463,10 +463,18 @@ pub enum HirOp {
     },
 
     // GPU intrinsics (value-returning)
-    GpuThreadId,
-    GpuWorkgroupId,
-    GpuWorkgroupSize,
-    GpuGlobalId,
+    GpuThreadId {
+        dim: u8,
+    },
+    GpuWorkgroupId {
+        dim: u8,
+    },
+    GpuWorkgroupSize {
+        dim: u8,
+    },
+    GpuGlobalId {
+        dim: u8,
+    },
     GpuBufferLoad {
         buf: HirValue,
         idx: HirValue,
@@ -481,15 +489,15 @@ pub enum HirOp {
     GpuLaunch {
         device: HirValue,
         kernel: Sid,
-        groups: HirValue,
-        threads: HirValue,
+        grid: [HirValue; 3],
+        block: [HirValue; 3],
         args: Vec<HirValue>,
     },
     GpuLaunchAsync {
         device: HirValue,
         kernel: Sid,
-        groups: HirValue,
-        threads: HirValue,
+        grid: [HirValue; 3],
+        block: [HirValue; 3],
         args: Vec<HirValue>,
     },
 
@@ -1149,28 +1157,36 @@ fn hir_op_values(op: &HirOp) -> Vec<HirValue> {
         | HirOp::StrParseBool { s } => vec![s.clone()],
         HirOp::JsonEncode { v, .. } => vec![v.clone()],
         HirOp::JsonDecode { s, .. } => vec![s.clone()],
-        HirOp::GpuThreadId
-        | HirOp::GpuWorkgroupId
-        | HirOp::GpuWorkgroupSize
-        | HirOp::GpuGlobalId => vec![],
+        HirOp::GpuThreadId { .. }
+        | HirOp::GpuWorkgroupId { .. }
+        | HirOp::GpuWorkgroupSize { .. }
+        | HirOp::GpuGlobalId { .. } => vec![],
         HirOp::GpuBufferLoad { buf, idx } => vec![buf.clone(), idx.clone()],
         HirOp::GpuBufferLen { buf } => vec![buf.clone()],
         HirOp::GpuShared { size, .. } => vec![size.clone()],
         HirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | HirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
-            let mut vs = vec![device.clone(), groups.clone(), threads.clone()];
+            let mut vs = vec![
+                device.clone(),
+                grid[0].clone(),
+                grid[1].clone(),
+                grid[2].clone(),
+                block[0].clone(),
+                block[1].clone(),
+                block[2].clone(),
+            ];
             vs.extend(args.iter().cloned());
             vs
         }

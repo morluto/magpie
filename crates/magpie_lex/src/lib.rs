@@ -38,6 +38,8 @@ pub enum TokenKind {
     Unsafe,
     Gpu,
     Target,
+    Workgroup,
+    Requires,
     Sig,
     Impl,
 
@@ -396,8 +398,13 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        if kind == TokenKind::FloatLit && (self.starts_with("f32") || self.starts_with("f64")) {
-            self.pos += 3;
+        if kind == TokenKind::FloatLit {
+            if self.starts_with("bf16") {
+                self.pos += 4;
+            } else if self.starts_with("f16") || self.starts_with("f32") || self.starts_with("f64")
+            {
+                self.pos += 3;
+            }
         }
 
         let text = self.source[start..self.pos].to_string();
@@ -684,6 +691,8 @@ fn keyword_kind(text: &str) -> Option<TokenKind> {
         "unsafe" => TokenKind::Unsafe,
         "gpu" => TokenKind::Gpu,
         "target" => TokenKind::Target,
+        "workgroup" => TokenKind::Workgroup,
+        "requires" => TokenKind::Requires,
         "sig" => TokenKind::Sig,
         "impl" => TokenKind::Impl,
         "true" => TokenKind::True,

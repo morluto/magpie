@@ -18,6 +18,10 @@ use magpie_diag::{
     Severity, SuggestedFix, TokenBudget,
 };
 use magpie_gpu::{compute_kernel_layout, generate_kernel_registry_ir, generate_spirv_with_layout};
+use magpie_gpu_hip::HipEmitter;
+use magpie_gpu_msl::MslEmitter;
+use magpie_gpu_ptx::PtxEmitter;
+use magpie_gpu_wgsl::WgslEmitter;
 use magpie_hir::{
     verify_hir, BlockId, HirBlock, HirConst, HirConstLit, HirFunction, HirInstr, HirModule, HirOp,
     HirOpVoid, HirTerminator, HirTypeDecl, HirValue, LocalId,
@@ -25,8 +29,8 @@ use magpie_hir::{
 use magpie_lex::lex;
 use magpie_memory::{build_index_with_sources, MmsItem, MmsSourceFingerprint};
 use magpie_mpir::{
-    print_mpir, verify_mpir, MpirBlock, MpirFn, MpirInstr, MpirLocalDecl, MpirModule, MpirOp,
-    MpirOpVoid, MpirTerminator, MpirTypeTable, MpirValue,
+    print_mpir, verify_mpir, MpirBlock, MpirFn, MpirGpuMeta, MpirInstr, MpirLocalDecl, MpirModule,
+    MpirOp, MpirOpVoid, MpirTerminator, MpirTypeTable, MpirValue,
 };
 use magpie_own::check_ownership;
 use magpie_parse::parse_file;
@@ -83,6 +87,25 @@ impl BuildProfile {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuConfig {
+    pub backend: Option<String>,
+    pub fallback: String,
+    pub device_index: i32,
+    pub mock_in_tests: bool,
+    pub llc_path: Option<String>,
+    pub lld_path: Option<String>,
+    pub mlx_enabled: bool,
+}
+
+fn default_gpu_config() -> GpuConfig {
+    GpuConfig {
+        fallback: "none".to_string(),
+        device_index: -1,
+        ..GpuConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DriverConfig {
     pub entry_path: String,
@@ -100,6 +123,7 @@ pub struct DriverConfig {
     pub llm_budget_policy: Option<String>,
     pub shared_generics: bool,
     pub features: Vec<String>,
+    pub gpu_config: GpuConfig,
 }
 
 impl Default for DriverConfig {
@@ -120,6 +144,7 @@ impl Default for DriverConfig {
             llm_budget_policy: None,
             shared_generics: false,
             features: Vec::new(),
+            gpu_config: default_gpu_config(),
         }
     }
 }
@@ -144,6 +169,9 @@ pub struct TestResult {
 struct GpuKernelDecl {
     sid: Sid,
     target: String,
+    is_unsafe: bool,
+    workgroup: Option<[u32; 3]>,
+    requires: Vec<String>,
 }
 
 /// Build JSON output envelope per §26.1.
@@ -362,6 +390,69 @@ fn resolve_manifest_build_entry(entry_path: &str) -> Option<String> {
     Some(resolved.to_string_lossy().to_string())
 }
 
+fn parse_gpu_config(toml_value: &toml::Value) -> GpuConfig {
+    let mut config = GpuConfig::default();
+    config.fallback = "none".to_string();
+    config.device_index = -1;
+
+    if let Some(gpu) = toml_value.get("gpu") {
+        if let Some(backend) = gpu.get("backend").and_then(|v| v.as_str()) {
+            config.backend = Some(backend.to_string());
+        }
+        if let Some(fallback) = gpu.get("fallback").and_then(|v| v.as_str()) {
+            config.fallback = fallback.to_string();
+        }
+        if let Some(idx) = gpu.get("device_index").and_then(|v| v.as_integer()) {
+            config.device_index = idx as i32;
+        }
+        if let Some(mock) = gpu.get("mock_in_tests").and_then(|v| v.as_bool()) {
+            config.mock_in_tests = mock;
+        }
+
+        if let Some(tools) = gpu.get("tools") {
+            if let Some(llc) = tools.get("llc").and_then(|v| v.as_str()) {
+                config.llc_path = Some(llc.to_string());
+            }
+            if let Some(lld) = tools.get("lld").and_then(|v| v.as_str()) {
+                config.lld_path = Some(lld.to_string());
+            }
+        }
+    }
+
+    if let Some(mlx) = toml_value.get("mlx") {
+        if let Some(enabled) = mlx.get("enabled").and_then(|v| v.as_bool()) {
+            config.mlx_enabled = enabled;
+        }
+    }
+
+    config
+}
+
+fn resolve_manifest_gpu_config(entry_path: &str) -> Option<GpuConfig> {
+    let manifest_path = discover_manifest_path(entry_path).or_else(discover_manifest_from_cwd)?;
+    let raw = fs::read_to_string(manifest_path).ok()?;
+    let toml_value = toml::from_str::<toml::Value>(&raw).ok()?;
+    Some(parse_gpu_config(&toml_value))
+}
+
+fn gpu_capability_supported_by_target(target: &str, capability: &str) -> bool {
+    let target = target.trim().to_ascii_lowercase();
+    let cap = capability.trim().to_ascii_lowercase();
+    if cap.is_empty() {
+        return false;
+    }
+
+    match cap.as_str() {
+        "device_malloc" | "device_free" => matches!(target.as_str(), "ptx" | "hip"),
+        _ if cap.starts_with("metal.") => target == "msl",
+        _ if cap.starts_with("cuda.") => target == "ptx",
+        _ if cap.starts_with("hip.") => target == "hip",
+        _ if cap.starts_with("spv.") || cap.starts_with("vulkan.") => target == "spv",
+        _ if cap.starts_with("wgsl.") || cap.starts_with("webgpu.") => target == "wgsl",
+        _ => true,
+    }
+}
+
 fn discover_manifest_path(entry_path: &str) -> Option<PathBuf> {
     let path = PathBuf::from(entry_path);
     let mut current = if path.is_dir() {
@@ -405,6 +496,12 @@ pub fn build(config: &DriverConfig) -> BuildResult {
     if is_default_entry_path(&effective_config.entry_path) {
         if let Some(manifest_entry) = resolve_manifest_build_entry(&effective_config.entry_path) {
             effective_config.entry_path = manifest_entry;
+        }
+    }
+    if effective_config.gpu_config == default_gpu_config() {
+        if let Some(manifest_gpu_config) = resolve_manifest_gpu_config(&effective_config.entry_path)
+        {
+            effective_config.gpu_config = manifest_gpu_config;
         }
     }
     let config = &effective_config;
@@ -723,15 +820,28 @@ pub fn build(config: &DriverConfig) -> BuildResult {
     {
         let start = Instant::now();
         let mut diag = DiagnosticBag::new(max_errors);
+        let fallback_cpu = config.gpu_config.fallback.eq_ignore_ascii_case("cpu");
+        let default_gpu_backend = config
+            .gpu_config
+            .backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let module_count = mpir_modules.len();
         let emit_llvm_bc = emit_contains(&config.emit, "llvm-bc");
         let emit_spv = emit_contains(&config.emit, "spv");
+        let emit_msl = emit_contains(&config.emit, "msl");
+        let emit_ptx = emit_contains(&config.emit, "ptx");
+        let emit_hip = emit_contains(&config.emit, "hip");
+        let emit_wgsl = emit_contains(&config.emit, "wgsl");
         for (idx, module) in mpir_modules.iter().enumerate() {
             match magpie_codegen_llvm::codegen_module_with_options(
                 module,
                 &type_ctx,
                 magpie_codegen_llvm::CodegenOptions {
                     shared_generics: config.shared_generics,
+                    gpu_cpu_fallback: fallback_cpu,
                 },
             ) {
                 Ok(llvm_ir) => {
@@ -766,7 +876,7 @@ pub fn build(config: &DriverConfig) -> BuildResult {
                 Err(err) => {
                     emit_driver_diag(
                         &mut diag,
-                        "MPG0001",
+                        "MPG_CORE_1301",
                         Severity::Error,
                         "llvm codegen failed",
                         err,
@@ -789,51 +899,290 @@ pub fn build(config: &DriverConfig) -> BuildResult {
                 };
                 seen_kernel_sids.insert(func.sid.0.clone());
 
-                if !kernel_decl.target.eq_ignore_ascii_case("spv") {
+                let target = if kernel_decl.target.trim().is_empty() {
+                    default_gpu_backend
+                        .as_deref()
+                        .unwrap_or("spv")
+                        .to_ascii_lowercase()
+                } else {
+                    kernel_decl.target.to_ascii_lowercase()
+                };
+                let backend_target = match target.as_str() {
+                    "spv" => magpie_gpu::GpuBackend::Spv as u8,
+                    "msl" => magpie_gpu::GpuBackend::Msl as u8,
+                    "ptx" => magpie_gpu::GpuBackend::Ptx as u8,
+                    "hip" => magpie_gpu::GpuBackend::Hip as u8,
+                    "wgsl" => magpie_gpu::GpuBackend::Wgsl as u8,
+                    other => {
+                        emit_driver_diag(
+                            &mut diag,
+                            "MPG_CORE_1300",
+                            Severity::Error,
+                            "unsupported gpu target",
+                            format!(
+                                "gpu kernel '{}' declares unsupported target '{}'; supported targets are: spv, msl, ptx, hip, wgsl.",
+                                func.name, other
+                            ),
+                        );
+                        continue;
+                    }
+                };
+
+                let mut kernel_func = func.clone();
+                kernel_func.gpu_meta = Some(MpirGpuMeta {
+                    target: backend_target,
+                    workgroup: kernel_decl.workgroup.unwrap_or([64, 1, 1]),
+                    is_unsafe: kernel_decl.is_unsafe,
+                    requires: kernel_decl.requires.clone(),
+                });
+
+                if kernel_decl.is_unsafe {
                     emit_driver_diag(
                         &mut diag,
-                        "MPG1200",
-                        Severity::Error,
-                        "unsupported gpu target",
+                        "MPG_CORE_1202",
+                        Severity::Warning,
+                        "unsafe gpu fn is non-portable",
                         format!(
-                            "gpu kernel '{}' declares unsupported target '{}'; only target(spv) is supported in v0.1.",
-                            func.name, kernel_decl.target
+                            "gpu kernel '{}' is declared `unsafe gpu fn`; portability guarantees are reduced.",
+                            func.name
                         ),
                     );
-                    continue;
+                    if kernel_decl.requires.is_empty() {
+                        emit_driver_diag(
+                            &mut diag,
+                            "MPG_CORE_1201",
+                            Severity::Error,
+                            "unsafe gpu fn requires capability annotations",
+                            format!(
+                                "gpu kernel '{}' is `unsafe` but does not declare `requires(...)` capabilities.",
+                                func.name
+                            ),
+                        );
+                    }
+                }
+                for capability in &kernel_decl.requires {
+                    if !gpu_capability_supported_by_target(target.as_str(), capability) {
+                        emit_driver_diag(
+                            &mut diag,
+                            "MPG_CORE_1200",
+                            Severity::Error,
+                            "gpu capability not supported by target backend",
+                            format!(
+                                "gpu kernel '{}' capability '{}' is not supported on target '{}'.",
+                                func.name, capability, target
+                            ),
+                        );
+                    }
                 }
 
-                let _ = magpie_gpu::validate_kernel(func, &type_ctx, &mut diag);
-                let layout = compute_kernel_layout(func, &type_ctx);
-                match generate_spirv_with_layout(func, &layout, &type_ctx) {
-                    Ok(spirv) => {
-                        if emit_spv {
-                            let spv_path = stage_gpu_kernel_spv_output_path(config, &func.sid);
-                            match write_binary_artifact(&spv_path, &spirv) {
-                                Ok(()) => {
-                                    let artifact = spv_path.to_string_lossy().to_string();
-                                    if !result.artifacts.contains(&artifact) {
-                                        result.artifacts.push(artifact);
+                let _ = magpie_gpu::validate_kernel(&kernel_func, &type_ctx, &mut diag);
+                let layout = compute_kernel_layout(&kernel_func, &type_ctx);
+                match target.as_str() {
+                    "spv" => match generate_spirv_with_layout(&kernel_func, &layout, &type_ctx) {
+                        Ok(spirv) => {
+                            if emit_spv {
+                                let spv_path = stage_gpu_kernel_spv_output_path(config, &func.sid);
+                                match write_binary_artifact(&spv_path, &spirv) {
+                                    Ok(()) => {
+                                        let artifact = spv_path.to_string_lossy().to_string();
+                                        if !result.artifacts.contains(&artifact) {
+                                            result.artifacts.push(artifact);
+                                        }
+                                    }
+                                    Err(err) => emit_driver_diag(
+                                        &mut diag,
+                                        "MPP0003",
+                                        Severity::Error,
+                                        "failed to write spir-v artifact",
+                                        err,
+                                    ),
+                                }
+                            }
+                            kernel_entries.push((
+                                func.sid.0.clone(),
+                                backend_target,
+                                layout,
+                                spirv,
+                            ));
+                        }
+                        Err(err) => emit_driver_diag(
+                            &mut diag,
+                            "MPG_CORE_1301",
+                            Severity::Error,
+                            "gpu kernel spir-v lowering failed",
+                            err,
+                        ),
+                    },
+                    "msl" => {
+                        let emitter = MslEmitter::new();
+                        match emitter.emit_kernel(&kernel_func, &type_ctx) {
+                            Ok(msl_bytes) => {
+                                if emit_msl {
+                                    let path = stage_gpu_kernel_backend_output_path(
+                                        config, &func.sid, "metal",
+                                    );
+                                    match write_binary_artifact(&path, &msl_bytes) {
+                                        Ok(()) => {
+                                            let artifact = path.to_string_lossy().to_string();
+                                            if !result.artifacts.contains(&artifact) {
+                                                result.artifacts.push(artifact);
+                                            }
+                                        }
+                                        Err(err) => emit_driver_diag(
+                                            &mut diag,
+                                            "MPP0003",
+                                            Severity::Error,
+                                            "failed to write msl artifact",
+                                            err,
+                                        ),
                                     }
                                 }
-                                Err(err) => emit_driver_diag(
-                                    &mut diag,
-                                    "MPP0003",
-                                    Severity::Error,
-                                    "failed to write spir-v artifact",
-                                    err,
-                                ),
+                                kernel_entries.push((
+                                    func.sid.0.clone(),
+                                    backend_target,
+                                    layout,
+                                    msl_bytes,
+                                ));
                             }
+                            Err(err) => emit_driver_diag(
+                                &mut diag,
+                                "MPG_CORE_1301",
+                                Severity::Error,
+                                "gpu kernel msl lowering failed",
+                                err,
+                            ),
                         }
-                        kernel_entries.push((func.sid.0.clone(), layout, spirv));
                     }
-                    Err(err) => emit_driver_diag(
-                        &mut diag,
-                        "MPG1202",
-                        Severity::Error,
-                        "gpu kernel spir-v lowering failed",
-                        err,
-                    ),
+                    "ptx" => {
+                        let mut emitter = PtxEmitter::new();
+                        if let Some(llc_path) = config.gpu_config.llc_path.as_ref() {
+                            emitter = emitter.with_llc_path(llc_path.clone());
+                        }
+                        match emitter.emit_kernel(&kernel_func, &type_ctx) {
+                            Ok(ptx_bytes) => {
+                                if emit_ptx {
+                                    let path = stage_gpu_kernel_backend_output_path(
+                                        config, &func.sid, "ptx",
+                                    );
+                                    match write_binary_artifact(&path, &ptx_bytes) {
+                                        Ok(()) => {
+                                            let artifact = path.to_string_lossy().to_string();
+                                            if !result.artifacts.contains(&artifact) {
+                                                result.artifacts.push(artifact);
+                                            }
+                                        }
+                                        Err(err) => emit_driver_diag(
+                                            &mut diag,
+                                            "MPP0003",
+                                            Severity::Error,
+                                            "failed to write ptx artifact",
+                                            err,
+                                        ),
+                                    }
+                                }
+                                kernel_entries.push((
+                                    func.sid.0.clone(),
+                                    backend_target,
+                                    layout,
+                                    ptx_bytes,
+                                ));
+                            }
+                            Err(err) => emit_driver_diag(
+                                &mut diag,
+                                "MPG_CORE_1301",
+                                Severity::Error,
+                                "gpu kernel ptx lowering failed",
+                                err,
+                            ),
+                        }
+                    }
+                    "hip" => {
+                        let mut emitter = HipEmitter::new();
+                        if let Some(llc_path) = config.gpu_config.llc_path.as_ref() {
+                            emitter = emitter.with_llc_path(llc_path.clone());
+                        }
+                        if let Some(lld_path) = config.gpu_config.lld_path.as_ref() {
+                            emitter = emitter.with_lld_path(lld_path.clone());
+                        }
+                        match emitter.emit_kernel(&kernel_func, &type_ctx) {
+                            Ok(hsaco_bytes) => {
+                                if emit_hip {
+                                    let path = stage_gpu_kernel_backend_output_path(
+                                        config, &func.sid, "hsaco",
+                                    );
+                                    match write_binary_artifact(&path, &hsaco_bytes) {
+                                        Ok(()) => {
+                                            let artifact = path.to_string_lossy().to_string();
+                                            if !result.artifacts.contains(&artifact) {
+                                                result.artifacts.push(artifact);
+                                            }
+                                        }
+                                        Err(err) => emit_driver_diag(
+                                            &mut diag,
+                                            "MPP0003",
+                                            Severity::Error,
+                                            "failed to write hip artifact",
+                                            err,
+                                        ),
+                                    }
+                                }
+                                kernel_entries.push((
+                                    func.sid.0.clone(),
+                                    backend_target,
+                                    layout,
+                                    hsaco_bytes,
+                                ));
+                            }
+                            Err(err) => emit_driver_diag(
+                                &mut diag,
+                                "MPG_CORE_1301",
+                                Severity::Error,
+                                "gpu kernel hip lowering failed",
+                                err,
+                            ),
+                        }
+                    }
+                    "wgsl" => {
+                        let emitter = WgslEmitter::new();
+                        match emitter.emit_kernel(&kernel_func, &type_ctx) {
+                            Ok(wgsl_bytes) => {
+                                if emit_wgsl {
+                                    let path = stage_gpu_kernel_backend_output_path(
+                                        config, &func.sid, "wgsl",
+                                    );
+                                    match write_binary_artifact(&path, &wgsl_bytes) {
+                                        Ok(()) => {
+                                            let artifact = path.to_string_lossy().to_string();
+                                            if !result.artifacts.contains(&artifact) {
+                                                result.artifacts.push(artifact);
+                                            }
+                                        }
+                                        Err(err) => emit_driver_diag(
+                                            &mut diag,
+                                            "MPP0003",
+                                            Severity::Error,
+                                            "failed to write wgsl artifact",
+                                            err,
+                                        ),
+                                    }
+                                }
+                                kernel_entries.push((
+                                    func.sid.0.clone(),
+                                    backend_target,
+                                    layout,
+                                    wgsl_bytes,
+                                ));
+                            }
+                            Err(err) => emit_driver_diag(
+                                &mut diag,
+                                "MPG_CORE_1301",
+                                Severity::Error,
+                                "gpu kernel wgsl lowering failed",
+                                err,
+                            ),
+                        }
+                    }
+                    _ => unreachable!("validated gpu target"),
                 }
             }
         }
@@ -842,7 +1191,7 @@ pub fn build(config: &DriverConfig) -> BuildResult {
             if !seen_kernel_sids.contains(&decl.sid.0) {
                 emit_driver_diag(
                     &mut diag,
-                    "MPG1203",
+                    "MPG_CORE_1302",
                     Severity::Warning,
                     "gpu kernel missing in lowered mpir",
                     format!(
@@ -1269,6 +1618,9 @@ fn collect_gpu_kernel_decls(resolved_modules: &[ResolvedModule]) -> Vec<GpuKerne
                 out.push(GpuKernelDecl {
                     sid: sym.sid.clone(),
                     target: gpu_fn.target.clone(),
+                    is_unsafe: gpu_fn.is_unsafe,
+                    workgroup: gpu_fn.workgroup,
+                    requires: gpu_fn.requires.clone(),
                 });
             }
         }
@@ -2128,28 +2480,36 @@ fn hir_op_values(op: &HirOp) -> Vec<HirValue> {
         | HirOp::StrParseBool { s } => vec![s.clone()],
         HirOp::JsonEncode { v, .. } => vec![v.clone()],
         HirOp::JsonDecode { s, .. } => vec![s.clone()],
-        HirOp::GpuThreadId
-        | HirOp::GpuWorkgroupId
-        | HirOp::GpuWorkgroupSize
-        | HirOp::GpuGlobalId => vec![],
+        HirOp::GpuThreadId { .. }
+        | HirOp::GpuWorkgroupId { .. }
+        | HirOp::GpuWorkgroupSize { .. }
+        | HirOp::GpuGlobalId { .. } => vec![],
         HirOp::GpuBufferLoad { buf, idx } => vec![buf.clone(), idx.clone()],
         HirOp::GpuBufferLen { buf } => vec![buf.clone()],
         HirOp::GpuShared { size, .. } => vec![size.clone()],
         HirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | HirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
-            let mut vs = vec![device.clone(), groups.clone(), threads.clone()];
+            let mut vs = vec![
+                device.clone(),
+                grid[0].clone(),
+                grid[1].clone(),
+                grid[2].clone(),
+                block[0].clone(),
+                block[1].clone(),
+                block[2].clone(),
+            ];
             vs.extend(args.iter().cloned());
             vs
         }
@@ -3290,10 +3650,10 @@ fn remap_hir_op_type_ids(op: &mut HirOp, remap: &HashMap<TypeId, TypeId>) {
             *val_ty = remap_type_id(*val_ty, remap);
         }
         HirOp::StrBuilderNew
-        | HirOp::GpuThreadId
-        | HirOp::GpuWorkgroupId
-        | HirOp::GpuWorkgroupSize
-        | HirOp::GpuGlobalId => {}
+        | HirOp::GpuThreadId { .. }
+        | HirOp::GpuWorkgroupId { .. }
+        | HirOp::GpuWorkgroupSize { .. }
+        | HirOp::GpuGlobalId { .. } => {}
         HirOp::StrBuilderAppendStr { b, s } => {
             remap_hir_value_type_ids(b, remap);
             remap_hir_value_type_ids(s, remap);
@@ -3319,21 +3679,25 @@ fn remap_hir_op_type_ids(op: &mut HirOp, remap: &HashMap<TypeId, TypeId>) {
         }
         HirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | HirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
             remap_hir_value_type_ids(device, remap);
-            remap_hir_value_type_ids(groups, remap);
-            remap_hir_value_type_ids(threads, remap);
+            for value in grid {
+                remap_hir_value_type_ids(value, remap);
+            }
+            for value in block {
+                remap_hir_value_type_ids(value, remap);
+            }
             for value in args {
                 remap_hir_value_type_ids(value, remap);
             }
@@ -3481,6 +3845,7 @@ fn lower_hir_function_to_mpir(func: &HirFunction) -> MpirFn {
         blocks,
         locals,
         is_async: func.is_async,
+        gpu_meta: None,
     }
 }
 
@@ -3908,10 +4273,10 @@ fn lower_hir_op_to_mpir(op: &HirOp) -> MpirOp {
             ty: *ty,
             s: lower_hir_value_to_mpir(s),
         },
-        HirOp::GpuThreadId => MpirOp::GpuThreadId,
-        HirOp::GpuWorkgroupId => MpirOp::GpuWorkgroupId,
-        HirOp::GpuWorkgroupSize => MpirOp::GpuWorkgroupSize,
-        HirOp::GpuGlobalId => MpirOp::GpuGlobalId,
+        HirOp::GpuThreadId { dim } => MpirOp::GpuThreadId { dim: *dim },
+        HirOp::GpuWorkgroupId { dim } => MpirOp::GpuWorkgroupId { dim: *dim },
+        HirOp::GpuWorkgroupSize { dim } => MpirOp::GpuWorkgroupSize { dim: *dim },
+        HirOp::GpuGlobalId { dim } => MpirOp::GpuGlobalId { dim: *dim },
         HirOp::GpuBufferLoad { buf, idx } => MpirOp::GpuBufferLoad {
             buf: lower_hir_value_to_mpir(buf),
             idx: lower_hir_value_to_mpir(idx),
@@ -3926,27 +4291,43 @@ fn lower_hir_op_to_mpir(op: &HirOp) -> MpirOp {
         HirOp::GpuLaunch {
             device,
             kernel,
-            groups,
-            threads,
+            grid,
+            block,
             args,
         } => MpirOp::GpuLaunch {
             device: lower_hir_value_to_mpir(device),
             kernel: kernel.clone(),
-            groups: lower_hir_value_to_mpir(groups),
-            threads: lower_hir_value_to_mpir(threads),
+            grid: [
+                lower_hir_value_to_mpir(&grid[0]),
+                lower_hir_value_to_mpir(&grid[1]),
+                lower_hir_value_to_mpir(&grid[2]),
+            ],
+            block: [
+                lower_hir_value_to_mpir(&block[0]),
+                lower_hir_value_to_mpir(&block[1]),
+                lower_hir_value_to_mpir(&block[2]),
+            ],
             args: args.iter().map(lower_hir_value_to_mpir).collect(),
         },
         HirOp::GpuLaunchAsync {
             device,
             kernel,
-            groups,
-            threads,
+            grid,
+            block,
             args,
         } => MpirOp::GpuLaunchAsync {
             device: lower_hir_value_to_mpir(device),
             kernel: kernel.clone(),
-            groups: lower_hir_value_to_mpir(groups),
-            threads: lower_hir_value_to_mpir(threads),
+            grid: [
+                lower_hir_value_to_mpir(&grid[0]),
+                lower_hir_value_to_mpir(&grid[1]),
+                lower_hir_value_to_mpir(&grid[2]),
+            ],
+            block: [
+                lower_hir_value_to_mpir(&block[0]),
+                lower_hir_value_to_mpir(&block[1]),
+                lower_hir_value_to_mpir(&block[2]),
+            ],
             args: args.iter().map(lower_hir_value_to_mpir).collect(),
         },
         HirOp::Panic { msg } => MpirOp::Panic {
@@ -4118,11 +4499,19 @@ fn stage_gpu_registry_output_path(config: &DriverConfig) -> PathBuf {
 }
 
 fn stage_gpu_kernel_spv_output_path(config: &DriverConfig, sid: &Sid) -> PathBuf {
+    stage_gpu_kernel_backend_output_path(config, sid, "spv")
+}
+
+fn stage_gpu_kernel_backend_output_path(
+    config: &DriverConfig,
+    sid: &Sid,
+    extension: &str,
+) -> PathBuf {
     build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str())
         .join("gpu")
-        .join(format!("{}.spv", sid_artifact_component(&sid.0)))
+        .join(format!("{}.{}", sid_artifact_component(&sid.0), extension))
 }
 
 fn sid_artifact_component(raw: &str) -> String {
@@ -5671,6 +6060,9 @@ fn planned_artifacts(config: &DriverConfig, diagnostics: &mut Vec<Diagnostic>) -
             // SPIR-V outputs are emitted per-kernel under `<target>/<triple>/<profile>/gpu/`.
             // They are discovered dynamically during stage10, so no single planned file applies.
             "spv" => None,
+            // Other GPU backend outputs are emitted per-kernel under `<target>/<triple>/<profile>/gpu/`.
+            // They are discovered dynamically during stage10.
+            "msl" | "ptx" | "hip" | "wgsl" => None,
             "exe" => Some(base.join(format!("{stem}{}", if is_windows { ".exe" } else { "" }))),
             "shared-lib" => {
                 let ext = if is_windows {

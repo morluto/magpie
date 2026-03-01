@@ -931,10 +931,10 @@ fn op_consumed_locals(op: &MpirOp) -> Vec<LocalId> {
         | MpirOp::StrParseBool { .. }
         | MpirOp::JsonEncode { .. }
         | MpirOp::JsonDecode { .. }
-        | MpirOp::GpuThreadId
-        | MpirOp::GpuWorkgroupId
-        | MpirOp::GpuWorkgroupSize
-        | MpirOp::GpuGlobalId
+        | MpirOp::GpuThreadId { .. }
+        | MpirOp::GpuWorkgroupId { .. }
+        | MpirOp::GpuWorkgroupSize { .. }
+        | MpirOp::GpuGlobalId { .. }
         | MpirOp::GpuBufferLoad { .. }
         | MpirOp::GpuBufferLen { .. }
         | MpirOp::GpuShared { .. }
@@ -1124,10 +1124,10 @@ fn for_each_value_in_op(op: &MpirOp, mut f: impl FnMut(&MpirValue)) {
         MpirOp::PtrNull { .. }
         | MpirOp::MapNew { .. }
         | MpirOp::StrBuilderNew
-        | MpirOp::GpuThreadId
-        | MpirOp::GpuWorkgroupId
-        | MpirOp::GpuWorkgroupSize
-        | MpirOp::GpuGlobalId => {}
+        | MpirOp::GpuThreadId { .. }
+        | MpirOp::GpuWorkgroupId { .. }
+        | MpirOp::GpuWorkgroupSize { .. }
+        | MpirOp::GpuGlobalId { .. } => {}
 
         MpirOp::PtrAdd { p, count }
         | MpirOp::ArrGet { arr: p, idx: count }
@@ -1213,21 +1213,25 @@ fn for_each_value_in_op(op: &MpirOp, mut f: impl FnMut(&MpirValue)) {
 
         MpirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | MpirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
             f(device);
-            f(groups);
-            f(threads);
+            for value in grid {
+                f(value);
+            }
+            for value in block {
+                f(value);
+            }
             for arg in args {
                 f(arg);
             }
@@ -1379,6 +1383,7 @@ mod tests {
                     name: "tmp".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -1426,6 +1431,7 @@ mod tests {
                 }],
                 locals: vec![],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -1580,6 +1586,7 @@ mod tests {
                 }],
                 locals: vec![],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };

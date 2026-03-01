@@ -171,6 +171,9 @@ pub struct AstFnDecl {
 pub struct AstGpuFnDecl {
     pub inner: AstFnDecl,
     pub target: String,
+    pub is_unsafe: bool,
+    pub workgroup: Option<[u32; 3]>,
+    pub requires: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -1811,10 +1811,10 @@ fn op_consumed_locals(
         | HirOp::StrParseBool { .. }
         | HirOp::JsonEncode { .. }
         | HirOp::JsonDecode { .. }
-        | HirOp::GpuThreadId
-        | HirOp::GpuWorkgroupId
-        | HirOp::GpuWorkgroupSize
-        | HirOp::GpuGlobalId
+        | HirOp::GpuThreadId { .. }
+        | HirOp::GpuWorkgroupId { .. }
+        | HirOp::GpuWorkgroupSize { .. }
+        | HirOp::GpuGlobalId { .. }
         | HirOp::GpuBufferLoad { .. }
         | HirOp::GpuBufferLen { .. }
         | HirOp::GpuShared { .. }
@@ -2022,10 +2022,10 @@ fn for_each_value_in_op(op: &HirOp, mut f: impl FnMut(&HirValue)) {
         HirOp::PtrNull { .. }
         | HirOp::MapNew { .. }
         | HirOp::StrBuilderNew
-        | HirOp::GpuThreadId
-        | HirOp::GpuWorkgroupId
-        | HirOp::GpuWorkgroupSize
-        | HirOp::GpuGlobalId => {}
+        | HirOp::GpuThreadId { .. }
+        | HirOp::GpuWorkgroupId { .. }
+        | HirOp::GpuWorkgroupSize { .. }
+        | HirOp::GpuGlobalId { .. } => {}
 
         HirOp::PtrAdd { p, count }
         | HirOp::ArrGet { arr: p, idx: count }
@@ -2111,21 +2111,25 @@ fn for_each_value_in_op(op: &HirOp, mut f: impl FnMut(&HirValue)) {
 
         HirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | HirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
             f(device);
-            f(groups);
-            f(threads);
+            for v in grid {
+                f(v);
+            }
+            for v in block {
+                f(v);
+            }
             for arg in args {
                 f(arg);
             }

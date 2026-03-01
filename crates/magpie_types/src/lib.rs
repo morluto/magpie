@@ -48,6 +48,7 @@ pub enum PrimType {
     U64,
     U128,
     F16,
+    Bf16,
     F32,
     F64,
     Bool, // alias for I1
@@ -75,13 +76,13 @@ impl PrimType {
     }
 
     pub fn is_float(&self) -> bool {
-        matches!(self, Self::F16 | Self::F32 | Self::F64)
+        matches!(self, Self::F16 | Self::Bf16 | Self::F32 | Self::F64)
     }
 
     pub fn is_signed(&self) -> bool {
         matches!(
             self,
-            Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128
+            Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128 | Self::Bf16
         )
     }
 
@@ -89,12 +90,38 @@ impl PrimType {
         match self {
             Self::I1 | Self::U1 | Self::Bool => 1,
             Self::I8 | Self::U8 => 8,
-            Self::I16 | Self::U16 | Self::F16 => 16,
+            Self::I16 | Self::U16 | Self::F16 | Self::Bf16 => 16,
             Self::I32 | Self::U32 | Self::F32 => 32,
             Self::I64 | Self::U64 | Self::F64 => 64,
             Self::I128 | Self::U128 => 128,
             Self::Unit => 0,
         }
+    }
+}
+
+impl std::fmt::Display for PrimType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::I1 => "i1",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::I128 => "i128",
+            Self::U1 => "u1",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::U128 => "u128",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Bool => "bool",
+            Self::Unit => "unit",
+        };
+        f.write_str(s)
     }
 }
 
@@ -173,6 +200,7 @@ pub mod fixed_type_ids {
     pub const F16: TypeId = TypeId(13);
     pub const F32: TypeId = TypeId(14);
     pub const F64: TypeId = TypeId(15);
+    pub const BF16: TypeId = TypeId(16);
     pub const STR: TypeId = TypeId(20);
     pub const STR_BUILDER: TypeId = TypeId(21);
     pub const ARRAY_BASE: TypeId = TypeId(22);
@@ -183,6 +211,15 @@ pub mod fixed_type_ids {
     pub const GPU_DEVICE: TypeId = TypeId(30);
     pub const GPU_BUFFER_BASE: TypeId = TypeId(31);
     pub const GPU_FENCE: TypeId = TypeId(32);
+    pub const GPU_ERROR: TypeId = TypeId(33);
+    pub const GPU_ERROR_KIND: TypeId = TypeId(34);
+    pub const GPU_PROFILE_SESSION: TypeId = TypeId(35);
+    pub const GPU_PROFILE_EVENT: TypeId = TypeId(36);
+    pub const GPU_MEMORY_STATS: TypeId = TypeId(37);
+    pub const MLX_ARRAY_BASE: TypeId = TypeId(38);
+    pub const MLX_LAYER_HANDLE: TypeId = TypeId(39);
+    pub const MLX_OPTIMIZER_HANDLE: TypeId = TypeId(40);
+    pub const GPU_KERNEL_INTERNAL: TypeId = TypeId(50);
     pub const USER_TYPE_START: TypeId = TypeId(1000);
 }
 
@@ -233,6 +270,7 @@ impl TypeCtx {
             (U128, TypeKind::Prim(PrimType::U128)),
             (U1, TypeKind::Prim(PrimType::U1)),
             (F16, TypeKind::Prim(PrimType::F16)),
+            (BF16, TypeKind::Prim(PrimType::Bf16)),
             (F32, TypeKind::Prim(PrimType::F32)),
             (F64, TypeKind::Prim(PrimType::F64)),
             (
@@ -291,6 +329,7 @@ impl TypeCtx {
             PrimType::U64 => fixed_type_ids::U64,
             PrimType::U128 => fixed_type_ids::U128,
             PrimType::F16 => fixed_type_ids::F16,
+            PrimType::Bf16 => fixed_type_ids::BF16,
             PrimType::F32 => fixed_type_ids::F32,
             PrimType::F64 => fixed_type_ids::F64,
         }
@@ -650,7 +689,7 @@ impl TypeCtx {
             PrimType::Unit => (0, 1),
             PrimType::Bool | PrimType::I1 | PrimType::U1 => (1, 1),
             PrimType::I8 | PrimType::U8 => (1, 1),
-            PrimType::I16 | PrimType::U16 | PrimType::F16 => (2, 2),
+            PrimType::I16 | PrimType::U16 | PrimType::F16 | PrimType::Bf16 => (2, 2),
             PrimType::I32 | PrimType::U32 | PrimType::F32 => (4, 4),
             PrimType::I64 | PrimType::U64 | PrimType::F64 => (8, 8),
             PrimType::I128 | PrimType::U128 => (16, 16),
@@ -751,6 +790,7 @@ impl TypeCtx {
             PrimType::U64 => "u64",
             PrimType::U128 => "u128",
             PrimType::F16 => "f16",
+            PrimType::Bf16 => "bf16",
             PrimType::F32 => "f32",
             PrimType::F64 => "f64",
             PrimType::Bool => "bool",

@@ -512,6 +512,7 @@ mod tests {
                 }],
                 locals: vec![],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };

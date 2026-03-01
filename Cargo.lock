@@ -425,6 +425,10 @@ dependencies = [
  "magpie_csnf",
  "magpie_diag",
  "magpie_gpu",
+ "magpie_gpu_hip",
+ "magpie_gpu_msl",
+ "magpie_gpu_ptx",
+ "magpie_gpu_wgsl",
  "magpie_hir",
  "magpie_lex",
  "magpie_memory",
@@ -438,6 +442,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -445,6 +450,56 @@ name = "magpie_gpu"
 version = "0.1.0"
 dependencies = [
  "magpie_diag",
+ "magpie_mpir",
+ "magpie_types",
+]
+
+[[package]]
+name = "magpie_gpu_hip"
+version = "0.1.0"
+dependencies = [
+ "magpie_diag",
+ "magpie_gpu",
+ "magpie_mpir",
+ "magpie_types",
+]
+
+[[package]]
+name = "magpie_gpu_msl"
+version = "0.1.0"
+dependencies = [
+ "magpie_diag",
+ "magpie_gpu",
+ "magpie_mpir",
+ "magpie_types",
+]
+
+[[package]]
+name = "magpie_gpu_ptx"
+version = "0.1.0"
+dependencies = [
+ "magpie_diag",
+ "magpie_gpu",
+ "magpie_mpir",
+ "magpie_types",
+]
+
+[[package]]
+name = "magpie_gpu_spirv"
+version = "0.1.0"
+dependencies = [
+ "magpie_diag",
+ "magpie_gpu",
+ "magpie_mpir",
+ "magpie_types",
+]
+
+[[package]]
+name = "magpie_gpu_wgsl"
+version = "0.1.0"
+dependencies = [
+ "magpie_diag",
+ "magpie_gpu",
  "magpie_mpir",
  "magpie_types",
 ]
@@ -490,6 +545,14 @@ dependencies = [
  "magpie_diag",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "magpie_mlx"
+version = "0.1.0"
+dependencies = [
+ "magpie_diag",
+ "magpie_types",
 ]
 
 [[package]]

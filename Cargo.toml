@@ -23,6 +23,12 @@ members = [
     "crates/magpie_ctx",
     "crates/magpie_web",
     "crates/magpie_gpu",
+    "crates/magpie_gpu_spirv",
+    "crates/magpie_gpu_msl",
+    "crates/magpie_gpu_ptx",
+    "crates/magpie_gpu_hip",
+    "crates/magpie_gpu_wgsl",
+    "crates/magpie_mlx",
     "crates/magpie_rt",
 ]
 

@@ -191,17 +191,54 @@ int32_t mp_rt_web_serve(
   MpRtHeader** out_errmsg
 );
 
-typedef struct MpRtGpuKernelEntry {
-  uint64_t sid_hash;
+typedef struct MpRtGpuParam {
+  uint8_t kind;
+  uint8_t _reserved0;
+  uint16_t _reserved1;
+  uint32_t type_id;
+  uint32_t offset_or_binding;
+  uint32_t size;
+} MpRtGpuParam;
+
+typedef struct MpRtGpuKernelBlob {
+  uint32_t backend;
+  const uint8_t* blob;
+  uint64_t blob_len;
+  uint32_t num_params;
+  const MpRtGpuParam* params;
   uint32_t num_buffers;
   uint32_t push_const_size;
+} MpRtGpuKernelBlob;
+
+typedef struct MpRtGpuKernelEntry {
+  uint64_t sid_hash;
+  uint32_t num_blobs;
+  uint32_t _reserved;
+  const MpRtGpuKernelBlob* blobs;
 } MpRtGpuKernelEntry;
 
+MpRtHeader* mp_rt_gpu_error_new(int32_t kind, const char* backend, const char* message, int32_t code);
+void mp_rt_gpu_error_drop(MpRtHeader* err);
+int32_t mp_rt_gpu_error_kind(MpRtHeader* err);
+MpRtHeader* mp_rt_gpu_error_message(MpRtHeader* err);
+MpRtHeader* mp_rt_gpu_error_backend(MpRtHeader* err);
+int32_t mp_rt_gpu_error_code(MpRtHeader* err);
+
+void mp_rt_gpu_init(void);
 uint32_t mp_rt_gpu_device_count(void);
-void mp_rt_gpu_register_kernels(const uint8_t* entries, int32_t count);
+uint32_t mp_rt_gpu_device_count_unified(void);
+void mp_rt_gpu_register_kernels(const MpRtGpuKernelEntry* entries, int32_t count);
 int32_t mp_rt_gpu_device_default(MpRtHeader** out_dev, MpRtHeader** out_errmsg);
+int32_t mp_rt_gpu_device_default_unified(MpRtHeader** out_dev, MpRtHeader** out_err);
 int32_t mp_rt_gpu_device_by_index(uint32_t idx, MpRtHeader** out_dev, MpRtHeader** out_errmsg);
 MpRtHeader* mp_rt_gpu_device_name(MpRtHeader* dev);
+int32_t mp_rt_gpu_device_backends(MpRtHeader* dev, MpRtHeader** out_arr, MpRtHeader** out_err);
+uint32_t mp_rt_gpu_device_max_workgroup_size(MpRtHeader* dev);
+uint32_t mp_rt_gpu_device_max_shared_bytes(MpRtHeader* dev);
+uint32_t mp_rt_gpu_device_max_buffers(MpRtHeader* dev);
+uint32_t mp_rt_gpu_device_warp_size(MpRtHeader* dev);
+uint64_t mp_rt_gpu_device_memory_total(MpRtHeader* dev);
+uint64_t mp_rt_gpu_device_memory_available(MpRtHeader* dev);
 int32_t mp_rt_gpu_buffer_new(
   MpRtHeader* dev,
   uint32_t elem_type_id,
@@ -210,6 +247,16 @@ int32_t mp_rt_gpu_buffer_new(
   uint32_t usage_flags,
   MpRtHeader** out_buf,
   MpRtHeader** out_errmsg
+);
+int32_t mp_rt_gpu_buffer_new_hinted(
+  MpRtHeader* dev,
+  uint32_t elem_type_id,
+  uint32_t elem_size,
+  uint64_t len,
+  uint32_t usage_flags,
+  uint32_t hint,
+  MpRtHeader** out_buf,
+  MpRtHeader** out_err
 );
 int32_t mp_rt_gpu_buffer_from_array(
   MpRtHeader* dev,
@@ -256,6 +303,15 @@ int32_t mp_rt_gpu_fence_wait(
   MpRtHeader** out_errmsg
 );
 void mp_rt_gpu_fence_free(MpRtHeader* fence);
+int32_t mp_rt_gpu_profile_begin(MpRtHeader* dev, MpRtHeader** out_session, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_end(MpRtHeader* session, MpRtHeader** out_events, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_mark_begin(MpRtHeader* session, MpRtHeader* name, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_mark_end(MpRtHeader* session, MpRtHeader* name, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_export_chrome(MpRtHeader* events, MpRtHeader* path, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_available_counters(MpRtHeader* dev, MpRtHeader** out_arr);
+int32_t mp_rt_gpu_profile_enable_counters(MpRtHeader* session, MpRtHeader* counters, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_read_counters(MpRtHeader* session, MpRtHeader** out_map, MpRtHeader** out_err);
+int32_t mp_rt_gpu_profile_memory_stats(MpRtHeader* dev, MpRtHeader** out_stats, MpRtHeader** out_err);
 uint8_t* mp_rt_gpu_device_open(int32_t idx);
 void mp_rt_gpu_device_close(uint8_t* dev);
 uint8_t* mp_rt_gpu_buffer_alloc(uint8_t* dev, uint64_t size);

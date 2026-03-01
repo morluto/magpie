@@ -187,6 +187,84 @@ pub mod codes {
     pub const MPL2021: &str = "MPL2021"; // MIXED_GENERICS_MODE
 }
 
+/// GPU diagnostic codes using backend-prefixed format (`MPG_<BACKEND>_<NUMBER>`).
+pub mod gpu_diag_codes {
+    pub const MPG_CORE_1100: &str = "MPG_CORE_1100";
+    pub const MPG_CORE_1101: &str = "MPG_CORE_1101";
+    pub const MPG_CORE_1102: &str = "MPG_CORE_1102";
+    pub const MPG_CORE_1103: &str = "MPG_CORE_1103";
+    pub const MPG_CORE_1104: &str = "MPG_CORE_1104";
+    pub const MPG_CORE_1105: &str = "MPG_CORE_1105";
+    pub const MPG_CORE_1106: &str = "MPG_CORE_1106";
+    pub const MPG_CORE_1107: &str = "MPG_CORE_1107";
+    pub const MPG_CORE_1200: &str = "MPG_CORE_1200";
+    pub const MPG_CORE_1201: &str = "MPG_CORE_1201";
+    pub const MPG_CORE_1202: &str = "MPG_CORE_1202";
+    pub const MPG_CORE_1300: &str = "MPG_CORE_1300";
+    pub const MPG_CORE_1301: &str = "MPG_CORE_1301";
+    pub const MPG_CORE_1302: &str = "MPG_CORE_1302";
+    pub const MPG_SPV_2001: &str = "MPG_SPV_2001";
+    pub const MPG_SPV_2002: &str = "MPG_SPV_2002";
+    pub const MPG_SPV_2003: &str = "MPG_SPV_2003";
+    pub const MPG_MSL_1001: &str = "MPG_MSL_1001";
+    pub const MPG_MSL_2001: &str = "MPG_MSL_2001";
+    pub const MPG_MSL_2002: &str = "MPG_MSL_2002";
+    pub const MPG_MSL_2003: &str = "MPG_MSL_2003";
+    pub const MPG_PTX_2001: &str = "MPG_PTX_2001";
+    pub const MPG_PTX_2002: &str = "MPG_PTX_2002";
+    pub const MPG_PTX_2003: &str = "MPG_PTX_2003";
+    pub const MPG_HIP_2001: &str = "MPG_HIP_2001";
+    pub const MPG_HIP_2002: &str = "MPG_HIP_2002";
+    pub const MPG_WGSL_1001: &str = "MPG_WGSL_1001";
+    pub const MPG_WGSL_1002: &str = "MPG_WGSL_1002";
+    pub const MPG_WGSL_1003: &str = "MPG_WGSL_1003";
+    pub const MPG_WGSL_1004: &str = "MPG_WGSL_1004";
+    pub const MPG_WGSL_1005: &str = "MPG_WGSL_1005";
+    pub const MPG_WGSL_1006: &str = "MPG_WGSL_1006";
+    pub const MPG_MLX_1001: &str = "MPG_MLX_1001";
+    pub const MPG_MLX_1002: &str = "MPG_MLX_1002";
+    pub const MPG_MLX_1003: &str = "MPG_MLX_1003";
+    pub const MPG_MLX_1004: &str = "MPG_MLX_1004";
+    pub const MPG_PROF_1001: &str = "MPG_PROF_1001";
+    pub const MPG_PROF_1002: &str = "MPG_PROF_1002";
+    pub const MPG_PROF_1003: &str = "MPG_PROF_1003";
+}
+
+/// Accept legacy `MPGNNNN` and new `MPG_<BACKEND>_<NNNN>` GPU code formats.
+pub fn is_valid_gpu_diag_code(code: &str) -> bool {
+    let normalized = code.trim().to_ascii_uppercase();
+
+    // Legacy transition format: MPG1100
+    if normalized.len() == 7
+        && normalized.starts_with(codes::MPG_PREFIX)
+        && normalized[3..].bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+
+    // New canonical format: MPG_CORE_1100
+    let mut parts = normalized.split('_');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    let Some(backend) = parts.next() else {
+        return false;
+    };
+    let Some(number) = parts.next() else {
+        return false;
+    };
+
+    if parts.next().is_some() {
+        return false;
+    }
+
+    prefix == codes::MPG_PREFIX
+        && !backend.is_empty()
+        && backend.bytes().all(|b| b.is_ascii_uppercase())
+        && number.len() == 4
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Token budget configuration (§3.1/§3.2/§3.4).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenBudget {
@@ -584,6 +662,8 @@ pub fn explain_code(code: &str) -> Option<String> {
                 "SSA remediation: ensure each value is defined before use, phi inputs match predecessor blocks, and control-flow edges stay structurally valid."
             } else if normalized.starts_with(codes::MPL_PREFIX) {
                 "Lint/LLM remediation: adjust build policy, token budget, or code structure to satisfy deterministic output constraints."
+            } else if normalized.starts_with(codes::MPG_PREFIX) {
+                "GPU remediation: ensure kernel code uses GPU-safe constructs, choose a supported backend/toolchain, and satisfy backend capability limits."
             } else {
                 return None;
             }
@@ -719,5 +799,22 @@ mod tests {
                 "payload should fit budget when budget metadata is omitted"
             );
         }
+    }
+
+    #[test]
+    fn gpu_diag_code_validation_accepts_legacy_and_prefixed_formats() {
+        assert!(is_valid_gpu_diag_code("MPG1100"));
+        assert!(is_valid_gpu_diag_code("MPG_CORE_1100"));
+        assert!(is_valid_gpu_diag_code("mpg_spv_2001"));
+        assert!(is_valid_gpu_diag_code("MPG_PROF_1003"));
+    }
+
+    #[test]
+    fn gpu_diag_code_validation_rejects_invalid_formats() {
+        assert!(!is_valid_gpu_diag_code("MPG11"));
+        assert!(!is_valid_gpu_diag_code("MPG_CORE_11"));
+        assert!(!is_valid_gpu_diag_code("MPG__1100"));
+        assert!(!is_valid_gpu_diag_code("MPG_CORE_1100_EXTRA"));
+        assert!(!is_valid_gpu_diag_code("MPG_CORE_11A0"));
     }
 }

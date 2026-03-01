@@ -465,10 +465,18 @@ pub enum MpirOp {
     },
 
     // GPU intrinsics
-    GpuThreadId,
-    GpuWorkgroupId,
-    GpuWorkgroupSize,
-    GpuGlobalId,
+    GpuThreadId {
+        dim: u8,
+    },
+    GpuWorkgroupId {
+        dim: u8,
+    },
+    GpuWorkgroupSize {
+        dim: u8,
+    },
+    GpuGlobalId {
+        dim: u8,
+    },
     GpuBufferLoad {
         buf: MpirValue,
         idx: MpirValue,
@@ -483,15 +491,15 @@ pub enum MpirOp {
     GpuLaunch {
         device: MpirValue,
         kernel: Sid,
-        groups: MpirValue,
-        threads: MpirValue,
+        grid: [MpirValue; 3],
+        block: [MpirValue; 3],
         args: Vec<MpirValue>,
     },
     GpuLaunchAsync {
         device: MpirValue,
         kernel: Sid,
-        groups: MpirValue,
-        threads: MpirValue,
+        grid: [MpirValue; 3],
+        block: [MpirValue; 3],
         args: Vec<MpirValue>,
     },
 
@@ -626,6 +634,14 @@ pub struct MpirLocalDecl {
     pub name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MpirGpuMeta {
+    pub target: u8, // GpuBackend discriminant
+    pub workgroup: [u32; 3],
+    pub is_unsafe: bool,
+    pub requires: Vec<String>,
+}
+
 /// MPIR function.
 #[derive(Clone, Debug)]
 pub struct MpirFn {
@@ -636,6 +652,7 @@ pub struct MpirFn {
     pub blocks: Vec<MpirBlock>,
     pub locals: Vec<MpirLocalDecl>,
     pub is_async: bool,
+    pub gpu_meta: Option<MpirGpuMeta>,
 }
 
 /// MPIR type table snapshot.
@@ -1075,6 +1092,18 @@ fn verify_function(
                     );
                 }
             }
+            if let Some(dim) = mpir_gpu_dim(&instr.op) {
+                if dim > 2 {
+                    emit_error(
+                        diag,
+                        "MPS0001",
+                        &format!(
+                            "Invalid operand: gpu intrinsic dim={} out of range [0,2] in fn '{}'",
+                            dim, func.name
+                        ),
+                    );
+                }
+            }
             for v in mpir_op_values(&instr.op) {
                 check_value(&v, blk_idx, matches!(instr.op, MpirOp::Phi { .. }), diag);
             }
@@ -1160,6 +1189,16 @@ fn has_arc_op(op: &MpirOp) -> bool {
             | MpirOp::ArcRetainWeak { .. }
             | MpirOp::ArcReleaseWeak { .. }
     )
+}
+
+fn mpir_gpu_dim(op: &MpirOp) -> Option<u8> {
+    match op {
+        MpirOp::GpuThreadId { dim }
+        | MpirOp::GpuWorkgroupId { dim }
+        | MpirOp::GpuWorkgroupSize { dim }
+        | MpirOp::GpuGlobalId { dim } => Some(*dim),
+        _ => None,
+    }
 }
 
 fn has_arc_void_op(op: &MpirOpVoid) -> bool {
@@ -1429,28 +1468,36 @@ fn mpir_op_values(op: &MpirOp) -> Vec<MpirValue> {
         MpirOp::StrBuilderBuild { b } => vec![b.clone()],
         MpirOp::JsonEncode { v, .. } => vec![v.clone()],
         MpirOp::JsonDecode { s, .. } => vec![s.clone()],
-        MpirOp::GpuThreadId
-        | MpirOp::GpuWorkgroupId
-        | MpirOp::GpuWorkgroupSize
-        | MpirOp::GpuGlobalId => vec![],
+        MpirOp::GpuThreadId { .. }
+        | MpirOp::GpuWorkgroupId { .. }
+        | MpirOp::GpuWorkgroupSize { .. }
+        | MpirOp::GpuGlobalId { .. } => vec![],
         MpirOp::GpuBufferLoad { buf, idx } => vec![buf.clone(), idx.clone()],
         MpirOp::GpuBufferLen { buf } => vec![buf.clone()],
         MpirOp::GpuShared { size, .. } => vec![size.clone()],
         MpirOp::GpuLaunch {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         }
         | MpirOp::GpuLaunchAsync {
             device,
-            groups,
-            threads,
+            grid,
+            block,
             args,
             ..
         } => {
-            let mut vs = vec![device.clone(), groups.clone(), threads.clone()];
+            let mut vs = vec![
+                device.clone(),
+                grid[0].clone(),
+                grid[1].clone(),
+                grid[2].clone(),
+                block[0].clone(),
+                block[1].clone(),
+                block[2].clone(),
+            ];
             vs.extend(args.iter().cloned());
             vs
         }
@@ -1842,7 +1889,7 @@ fn prim_layout_size(p: PrimType) -> u32 {
         PrimType::Unit => 0,
         PrimType::I1 | PrimType::U1 | PrimType::Bool => 1,
         PrimType::I8 | PrimType::U8 => 1,
-        PrimType::I16 | PrimType::U16 | PrimType::F16 => 2,
+        PrimType::I16 | PrimType::U16 | PrimType::F16 | PrimType::Bf16 => 2,
         PrimType::I32 | PrimType::U32 | PrimType::F32 => 4,
         PrimType::I64 | PrimType::U64 | PrimType::F64 => 8,
         PrimType::I128 | PrimType::U128 => 16,
@@ -1977,6 +2024,7 @@ fn format_prim(p: PrimType) -> &'static str {
         PrimType::U64 => "u64",
         PrimType::U128 => "u128",
         PrimType::F16 => "f16",
+        PrimType::Bf16 => "bf16",
         PrimType::F32 => "f32",
         PrimType::F64 => "f64",
         PrimType::Bool => "bool",
@@ -2064,6 +2112,10 @@ fn format_op(op: &MpirOp) -> String {
         MpirOp::ArcRelease { v } => format!("arc.release {{ v={} }}", format_value(v)),
         MpirOp::ArcRetainWeak { v } => format!("arc.retain_weak {{ v={} }}", format_value(v)),
         MpirOp::ArcReleaseWeak { v } => format!("arc.release_weak {{ v={} }}", format_value(v)),
+        MpirOp::GpuThreadId { dim } => format!("gpu.thread_id {{ dim={} }}", dim),
+        MpirOp::GpuWorkgroupId { dim } => format!("gpu.workgroup_id {{ dim={} }}", dim),
+        MpirOp::GpuWorkgroupSize { dim } => format!("gpu.workgroup_size {{ dim={} }}", dim),
+        MpirOp::GpuGlobalId { dim } => format!("gpu.global_id {{ dim={} }}", dim),
         MpirOp::Panic { msg } => format!("panic {{ msg={} }}", format_value(msg)),
         _ => format!("{:?}", op),
     }
@@ -2179,6 +2231,7 @@ mod tests {
                 }],
                 locals: vec![],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -2245,6 +2298,7 @@ mod tests {
                     }],
                     locals: vec![],
                     is_async: false,
+                    gpu_meta: None,
                 },
                 MpirFn {
                     sid: Sid("F:CALLER0001".to_string()),
@@ -2271,6 +2325,7 @@ mod tests {
                         name: "ret".to_string(),
                     }],
                     is_async: false,
+                    gpu_meta: None,
                 },
             ],
             globals: vec![],
@@ -2324,6 +2379,7 @@ mod tests {
                     name: "tmp".to_string(),
                 }],
                 is_async: false,
+                gpu_meta: None,
             }],
             globals: vec![],
         };
@@ -2364,6 +2420,7 @@ mod tests {
                     }],
                     locals: vec![],
                     is_async: false,
+                    gpu_meta: None,
                 },
                 MpirFn {
                     sid: Sid("F:VCLER00100".to_string()),
@@ -2382,6 +2439,7 @@ mod tests {
                     }],
                     locals: vec![],
                     is_async: false,
+                    gpu_meta: None,
                 },
             ],
             globals: vec![],
