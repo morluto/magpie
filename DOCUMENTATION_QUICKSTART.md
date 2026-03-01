@@ -140,6 +140,12 @@ entry = "src/main.mp"
 mode_default = false
 token_budget = 8000
 budget_policy = "balanced"
+
+[gpu]
+backend = "auto"       # auto | spirv | msl | ptx | hip | wgsl
+fallback = "cpu"       # cpu | error
+# llc_path = "/path/to/llc"    # optional: for PTX/HIP compilation
+# lld_path = "/path/to/ld.lld" # optional: for HIP HSACO linking
 ```
 
 ---
@@ -267,7 +273,9 @@ Source (.mp)
      v
 +----+------------------------------------------------------------+
 |  Stage 10: stage10_codegen                                      |
-|  Lower MPIR -> LLVM IR / WASM / SPIR-V (magpie_codegen_*)      |
+|  Lower MPIR -> LLVM IR / WASM / GPU backends (magpie_codegen_*) |
+|  GPU: SPIR-V / MSL / PTX / HIP / WGSL via BackendEmitter trait  |
+|  Monomorphization: generic specialization (magpie_mono)          |
 +----+------------------------------------------------------------+
      |
      v
@@ -301,8 +309,15 @@ Artifacts: .mpir  .ll  .bc  .o  .exe  .mpdbg  .mpd  graphs
 | `magpie_arc` | ARC insertion + optimization passes |
 | `magpie_codegen_llvm` | LLVM IR lowering |
 | `magpie_codegen_wasm` | WASM lowering |
-| `magpie_rt` | Runtime ABI / support |
-| `magpie_gpu` | GPU codegen helpers |
+| `magpie_mono` | Monomorphization (BLAKE3-keyed generic specialization) |
+| `magpie_rt` | Runtime ABI, GPU dispatch (dlopen), profiling, MLX FFI |
+| `magpie_gpu` | GPU codegen core (BackendEmitter trait, CFG structurizer) |
+| `magpie_gpu_spirv` | SPIR-V backend (Vulkan) |
+| `magpie_gpu_msl` | Metal Shading Language backend (Apple) |
+| `magpie_gpu_ptx` | PTX/NVVM backend (NVIDIA CUDA) |
+| `magpie_gpu_hip` | HIP/HSACO backend (AMD ROCm) |
+| `magpie_gpu_wgsl` | WGSL backend (WebGPU) |
+| `magpie_mlx` | MLX host API integration (Apple Silicon ML) |
 | `magpie_memory` | Memory index / query workflows |
 
 ---
@@ -381,9 +396,13 @@ src/main.mp
   hello.s             <- Native assembly
 
      |
-     | --emit spv
+     | --emit spv / msl / ptx / hip / wgsl
      v
-  hello.spv           <- SPIR-V (GPU compute)
+  hello.spv           <- SPIR-V (Vulkan)
+  hello.metal         <- Metal Shading Language (Apple)
+  hello.ptx           <- PTX (NVIDIA CUDA)
+  hello.hsaco         <- HSACO (AMD ROCm)
+  hello.wgsl          <- WGSL (WebGPU)
 
      |
      | --emit mpdbg
@@ -432,7 +451,7 @@ Types
   |     |
   |     +-- Signed integers:   i1  i8  i16  i32  i64  i128
   |     +-- Unsigned integers: u1  u8  u16  u32  u64  u128
-  |     +-- Floats:            f16  f32  f64
+  |     +-- Floats:            f16  f32  f64  bf16
   |     +-- Other:             bool  unit
   |
   +-- Ownership-qualified types
@@ -584,6 +603,7 @@ bb1:
 | `--llm-budget-policy` | `balanced`, `diagnostics_first`, `slices_first`, `minimal` | resolved | Budget policy |
 | `--max-errors` | int | 20 | Max diagnostics per pass |
 | `--no-auto-fmt` | flag | false | Disable pre-build auto-format in LLM mode |
+| `--shared-generics` | flag | false | Use shared (vtable) generics mode |
 
 ### Subcommands
 
@@ -607,7 +627,9 @@ cargo run -p magpie_cli -- --entry src/main.mp --profile release --emit exe buil
 ```
 
 Supported emit kinds: `mpir`, `llvm-ir`, `llvm-bc`, `object`, `asm`, `exe`,
-`shared-lib`, `spv`, `mpd`, `mpdbg`, `symgraph`, `depsgraph`, `ownershipgraph`, `cfggraph`
+`shared-lib`, `mpd`, `mpdbg`, `symgraph`, `depsgraph`, `ownershipgraph`, `cfggraph`
+
+GPU emit kinds: `spv` (SPIR-V/Vulkan), `msl` (Metal), `ptx` (CUDA), `hip` (ROCm), `wgsl` (WebGPU)
 
 #### `run` — interpret via lli
 
@@ -1274,7 +1296,7 @@ setfield { field=x, obj=%pm, val=const.i64 5 }
 | `MPT*` | Type / Trait / v0.1 restrictions | Type mismatch, missing trait impl, invalid receiver kind, v0.1 restricted form |
 | `MPO*` | Ownership / Borrow / Move | Borrow crossing blocks, borrow in phi, returning borrow, use-after-move |
 | `MPF*` | FFI | Invalid extern binding, unsupported ABI form |
-| `MPG*` | GPU | Invalid GPU op context, buffer type mismatch |
+| `MPG*` | GPU | 39 codes: type errors (`MPG_TYP_*`), kernel validation (`MPG_KRN_*`), buffer (`MPG_BUF_*`), sync (`MPG_SYN_*`), capability (`MPG_CAP_*`), link (`MPG_LNK_*`), MLX (`MPG_MLX_*`), profiling (`MPG_PRF_*`) |
 | `MPL*` | Lint / Link / LLM budget | Lint warnings, linker errors, token budget exceeded |
 | `MPW*` | Web | Web framework integration errors |
 | `MPK*` | Package / Dependency | Manifest errors, missing dependency |
@@ -1380,6 +1402,11 @@ budget_policy = "balanced"
 | Extended examples | `DOCUMENTATION.md` §20 |
 | Formal grammar appendix | `DOCUMENTATION.md` Appendix A |
 | Full opcode appendix | `DOCUMENTATION.md` Appendix B–D |
-| Evidence matrix | `DOCUMENTATION.md` Appendix E–F |
+| Evidence matrix | `DOCUMENTATION.md` Appendix E |
+| GPU multi-backend architecture | `DOCUMENTATION.md` Appendix F |
+| MLX integration (Apple Silicon) | `DOCUMENTATION.md` Appendix G |
+| Monomorphization | `DOCUMENTATION.md` Appendix H |
+| GPU specification (detailed) | `SPEC_GPU_UPGRADE.md` |
+| GPU interop contracts | `GPU_INTEROP_SPEC.md` |
 | Skill guide (LLM agent usage) | `SKILL.md` |
 | All test fixtures | `tests/fixtures/` |

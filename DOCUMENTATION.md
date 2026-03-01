@@ -293,7 +293,7 @@ impl ord for TPoint = @ord_point
 
 - Signed ints: `i1 i8 i16 i32 i64 i128`
 - Unsigned ints: `u1 u8 u16 u32 u64 u128`
-- Floats: `f16 f32 f64`
+- Floats: `f16 f32 f64 bf16`
 - Others: `bool unit`
 
 ## 7.2 Ownership modifiers
@@ -650,6 +650,7 @@ This avoids both:
   │  i8..i128        │  Str                          │
   │  u8..u128        │  Array<T>                     │
   │  f16, f32, f64   │  Map<K, V>                    │
+  │  bf16            │                               │
   │  bool, unit      │  TStrBuilder                  │
   │  i1, u1          │  TFuture<T>                   │
   │                  │  TMutex<T>, TRwLock<T>        │
@@ -696,8 +697,15 @@ High-level crate roles:
 - `magpie_arc`: ARC insertion/optimization passes
 - `magpie_codegen_llvm`: LLVM lowering
 - `magpie_codegen_wasm`: wasm lowering path
-- `magpie_rt`: runtime ABI and support
-- `magpie_gpu`: GPU codegen helpers/registries
+- `magpie_mono`: monomorphization (BLAKE3-keyed generic specialization)
+- `magpie_rt`: runtime ABI, GPU dispatch (dlopen), profiling, MLX FFI
+- `magpie_gpu`: GPU codegen core (BackendEmitter trait, CFG structurizer, kernel registry)
+- `magpie_gpu_spirv`: SPIR-V backend (Vulkan)
+- `magpie_gpu_msl`: Metal Shading Language backend (Apple)
+- `magpie_gpu_ptx`: PTX/NVVM backend (NVIDIA CUDA)
+- `magpie_gpu_hip`: HIP/HSACO backend (AMD ROCm)
+- `magpie_gpu_wgsl`: WGSL backend (WebGPU)
+- `magpie_mlx`: MLX host API integration (Apple Silicon ML)
 - `magpie_web`: web framework + MCP integration paths
 - `magpie_memory`: index/query workflows for memory/context artifacts
 
@@ -784,8 +792,9 @@ This staged structure is intentionally visible in output timing and diagnostics.
            v
 ┌─────────────────────┐
 │ Stage 10: Codegen   │──> .ll (LLVM IR), .gpu_registry.ll
-│   magpie_codegen_llvm│
-│   magpie_gpu         │
+│   magpie_codegen_llvm│    GPU backends: .spv, .metal, .ptx, .hip, .wgsl
+│   magpie_gpu + 5     │    (spirv/msl/ptx/hip/wgsl emitters)
+│   magpie_mono        │    Monomorphization: generic specialization
 └──────────┬──────────┘
            v
 ┌─────────────────────┐
@@ -811,15 +820,20 @@ This staged structure is intentionally visible in output timing and diagnostics.
               │         │    │           │                     │
         magpie_parse  magpie_hir  magpie_arc            magpie_jit
               │         │           │
-          magpie_ast  magpie_own  magpie_mpir
+          magpie_ast  magpie_own  magpie_mpir ──── magpie_mono
               │         │           │
           magpie_csnf magpie_types magpie_gpu
-                        │
-                    magpie_diag    magpie_rt (runtime)
+                        │           ├── magpie_gpu_spirv (Vulkan)
+                    magpie_diag     ├── magpie_gpu_msl   (Metal)
+                                    ├── magpie_gpu_ptx   (CUDA)
+                                    ├── magpie_gpu_hip   (ROCm)
+                                    └── magpie_gpu_wgsl  (WebGPU)
+
+                                   magpie_rt (runtime, GPU dispatch, profiling)
+                                   magpie_mlx (MLX Apple Silicon ML)
                                    magpie_pkg
                                    magpie_memory
                                    magpie_ctx
-                                   magpie_mono
 ```
 
 ---
@@ -832,7 +846,6 @@ Supported emit kinds include:
 - `llvm-bc`
 - `object`
 - `asm`
-- `spv`
 - `exe`
 - `shared-lib`
 - `mpir`
@@ -842,6 +855,14 @@ Supported emit kinds include:
 - `depsgraph`
 - `ownershipgraph`
 - `cfggraph`
+
+GPU backend emit kinds:
+
+- `spv` — SPIR-V binary module (Vulkan)
+- `msl` — Metal Shading Language text (Apple)
+- `ptx` — PTX via LLVM IR with nvptx64 triple (NVIDIA CUDA)
+- `hip` — HSACO via LLVM IR with amdgcn triple (AMD ROCm)
+- `wgsl` — WGSL text (WebGPU)
 
 Typical usage:
 
@@ -869,7 +890,7 @@ Common code families:
 - `MPT*` type/trait/v0.1 restrictions
 - `MPO*` ownership/borrowing
 - `MPF*` FFI
-- `MPG*` GPU
+- `MPG*` GPU (39 codes: `MPG_TYP_*` type, `MPG_KRN_*` kernel, `MPG_BUF_*` buffer, `MPG_SYN_*` sync, `MPG_CAP_*` capability, `MPG_LNK_*` link, `MPG_MLX_*` MLX, `MPG_PRF_*` profiling)
 - `MPL*` lint/link/LLM budget
 - `MPW*` web
 - `MPK*` package/dependency
@@ -985,6 +1006,10 @@ Selected settings are resolved from a combination of:
 - `[llm].token_budget`
 - `[llm].tokenizer`
 - `[llm].budget_policy`
+- `[gpu].backend` — `auto`, `spirv`, `msl`, `ptx`, `hip`, `wgsl`
+- `[gpu].fallback` — `cpu` (default) or `error`
+- `[gpu].llc_path` — custom path to `llc` binary (PTX/HIP backends)
+- `[gpu].lld_path` — custom path to `ld.lld` binary (HIP backend)
 
 ---
 
@@ -1210,7 +1235,7 @@ type_ref := type_name | module_path "." type_name
 
 prim_type := "i1" | "i8" | "i16" | "i32" | "i64" | "i128"
       | "u1" | "u8" | "u16" | "u32" | "u64" | "u128"
-      | "f16" | "f32" | "f64"
+      | "f16" | "f32" | "f64" | "bf16"
       | "bool" | "unit"
 
 builtin_type := "Str"
@@ -1470,4 +1495,139 @@ magpie ctx pack --entry src/main.mp
 
 ---
 
-## Appendix F — Specific Notes Requested for v0.1
+## Appendix F — GPU Multi-Backend Architecture
+
+Magpie supports 5 GPU compute backends via a unified `BackendEmitter` trait defined in `magpie_gpu`:
+
+```rust
+pub trait BackendEmitter {
+    fn backend_id(&self) -> GpuBackend;
+    fn validate_kernel(&self, func: &MpirFn) -> Result<(), String>;
+    fn compute_layout(&self, func: &MpirFn, type_ctx: &TypeCtx) -> KernelLayout;
+    fn emit_kernel(&self, func: &MpirFn, type_ctx: &TypeCtx) -> Result<Vec<u8>, String>;
+    fn artifact_extension(&self) -> &'static str;
+}
+```
+
+### F.1 Backend matrix
+
+| Backend | Enum | Target triple | Control flow | Output |
+|---------|------|---------------|--------------|--------|
+| SPIR-V | `GpuBackend::Spv` (1) | — | Unstructured CFG | Binary SPIR-V module |
+| MSL | `GpuBackend::Msl` (2) | — | Structurized (Relooper) | Metal Shading Language text |
+| PTX | `GpuBackend::Ptx` (3) | `nvptx64-nvidia-cuda` | Unstructured LLVM IR | PTX via `llc` |
+| HIP | `GpuBackend::Hip` (4) | `amdgcn-amd-amdhsa` | Unstructured LLVM IR | HSACO via `llc` + `ld.lld` |
+| WGSL | `GpuBackend::Wgsl` (5) | — | Structurized (Relooper) | WGSL text |
+
+### F.2 CFG structurizer
+
+MSL and WGSL require structured control flow (no arbitrary `goto`). The `magpie_gpu::structurize` module implements a Relooper-style algorithm that converts MPIR basic blocks into structured nodes:
+
+- `StructuredNode::Block` — sequential code
+- `StructuredNode::IfElse` — conditional branch
+- `StructuredNode::Loop` — loop with break/continue
+- `StructuredNode::Return` — function return
+
+### F.3 Runtime GPU dispatch
+
+The runtime (`magpie_rt`) probes GPU backends at startup via `dlopen` in priority order:
+
+1. Metal.framework (macOS)
+2. libcuda.so / nvcuda.dll (NVIDIA)
+3. libamdhip64.so (AMD ROCm)
+4. libvulkan.so / vulkan-1.dll (Vulkan)
+5. libwgpu_native.so (WebGPU)
+
+Falls back to CPU simulation if no GPU backend is available.
+
+### F.4 GPU profiling system
+
+9 runtime ABI functions for GPU performance analysis:
+
+- Session lifecycle: `mp_rt_gpu_profile_begin()` / `mp_rt_gpu_profile_end()`
+- Region markers: `mp_rt_gpu_profile_mark_begin()` / `mp_rt_gpu_profile_mark_end()`
+- Export: `mp_rt_gpu_profile_export_chrome()` — Chrome trace JSON (`chrome://tracing`)
+- Hardware counters: `mp_rt_gpu_profile_available_counters()` / `enable_counters()` / `read_counters()`
+- Memory: `mp_rt_gpu_profile_memory_stats()` — allocation tracking (bytes/peak/count)
+
+### F.5 GPU manifest configuration
+
+```toml
+[gpu]
+backend = "auto"       # auto | spirv | msl | ptx | hip | wgsl
+fallback = "cpu"       # cpu | error
+llc_path = "/path/to/llc"    # optional: custom llc for PTX/HIP
+lld_path = "/path/to/ld.lld" # optional: custom lld for HIP HSACO
+```
+
+### F.6 GPU TypeIds (fixed allocation)
+
+| TypeId | Type |
+|--------|------|
+| 16 | `bf16` (bfloat16 primitive) |
+| 33 | `gpu.TError` |
+| 34 | `gpu.TErrorKind` |
+| 35 | `gpu.TProfileSession` |
+| 36 | `gpu.TProfileEvent` |
+| 37 | `gpu.TMemoryStats` |
+| 38 | `mlx.TArrayBase` |
+| 39 | `mlx.TLayerHandle` |
+| 40 | `mlx.TOptimizerHandle` |
+| 50 | `gpu.TKernelInternal` |
+
+### F.7 GPU diagnostic codes
+
+39 diagnostic codes in the `MPG_XXX_NNNN` format covering:
+- `MPG_TYP_*` — type errors (bf16 unsupported on backend, invalid buffer element type)
+- `MPG_KRN_*` — kernel validation (workgroup size limits, buffer count limits)
+- `MPG_BUF_*` — buffer errors (type mismatch, out of bounds)
+- `MPG_SYN_*` — synchronization (barrier misuse, fence errors)
+- `MPG_CAP_*` — capability (missing backend feature, unsupported op)
+- `MPG_LNK_*` — link errors (llc/lld not found, compilation failure)
+- `MPG_MLX_*` — MLX dispatch (dlopen failure, missing symbol)
+- `MPG_PRF_*` — profiling (session not started, export failure)
+
+---
+
+## Appendix G — MLX Integration (Apple Silicon ML)
+
+The `magpie_mlx` crate provides full MLX host API integration via `dlopen`/`dlsym` dispatch tables (~40 function pointers). MLX is loaded at runtime, not at build time, so the compiler can be built on any platform.
+
+### G.1 Dispatch table
+
+Required symbols (fail if missing): array lifecycle, element-wise ops, shape, reduction, eval, nn, random, optim, grad.
+
+Optional symbols (graceful degradation): transpose, expand_dims, squeeze, neg, abs, exp, log, sqrt, pow, max, min, argmax, argmin, linalg (norm, inv), nn activations (relu, gelu, softmax, layer_norm, batch_norm), optimizers (sgd, adamw), value_and_grad.
+
+### G.2 C-ABI entrypoints
+
+50+ `mp_rt_mlx_*` functions exposed for codegen integration:
+- Array: `array_from_data`, `array_shape`, `array_eval`, `array_to_data`
+- Ops: `add`, `subtract`, `multiply`, `divide`, `matmul`
+- NN: `linear`, `conv2d`, `relu`, `gelu`, `softmax`, `layer_norm`, `batch_norm`
+- Optim: `sgd_step`, `adamw_step`
+- Autograd: `grad`, `value_and_grad`
+
+---
+
+## Appendix H — Monomorphization
+
+The `magpie_mono` crate implements generic function specialization.
+
+### H.1 Algorithm
+
+1. Walk the MPIR module to find generic function calls
+2. For each unique concrete type argument set, compute a BLAKE3 hash
+3. Generate a specialized SID: `original_sid$mono$<hash>`
+4. Duplicate the function body with type parameters replaced by concrete types
+5. Rewrite call sites to target the specialized SID
+
+### H.2 Key functions
+
+- `monomorphize(modules, type_ctx)` — main entry point, processes all modules
+- `specialize_function(func, type_args, type_ctx)` — specialize a single function
+- `substitute_type(ty, bindings)` — replace type parameters with concrete types
+
+---
+
+## Appendix I — Specific Notes Requested for v0.1

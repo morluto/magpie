@@ -15,13 +15,18 @@ This repository is a Rust workspace for **Magpie v0.1**. It includes:
 - lexer/parser/semantic analysis/type checking
 - ownership checking
 - MPIR lowering + verification
+- monomorphization (BLAKE3-keyed specialization)
 - ARC insertion/optimization passes
-- LLVM-text and WASM codegen paths
+- LLVM-text, WASM, and multi-backend GPU codegen paths (SPIR-V, MSL, PTX, HIP, WGSL)
+- MLX host API integration (Apple Silicon ML acceleration)
+- GPU profiling system (Chrome trace export, allocation tracking)
+- runtime with real GPU dispatch via `dlopen` (Metal > CUDA > HIP > Vulkan > WebGPU)
+- `bf16` (bfloat16) primitive type
 - runtime, package, memory-index, graph, web, and MCP tooling
 
 ## Repository layout
 
-High-level crates:
+High-level crates (29 total):
 
 - `crates/magpie_cli` — command-line entrypoint (`magpie`)
 - `crates/magpie_driver` — compiler orchestration pipeline
@@ -29,11 +34,18 @@ High-level crates:
 - `crates/magpie_sema`, `magpie_hir`, `magpie_types` — semantic + type layers
 - `crates/magpie_own` — ownership/borrow checker
 - `crates/magpie_mpir`, `magpie_mono`, `magpie_arc` — mid-level IR and lowering passes
-- `crates/magpie_codegen_llvm`, `magpie_codegen_wasm` — backend codegen
-- `crates/magpie_rt` — runtime library
+- `crates/magpie_codegen_llvm`, `magpie_codegen_wasm` — CPU backend codegen
+- `crates/magpie_gpu` — GPU codegen core (BackendEmitter trait, CFG structurizer, kernel registry)
+- `crates/magpie_gpu_spirv` — SPIR-V backend (Vulkan)
+- `crates/magpie_gpu_msl` — Metal Shading Language backend (Apple)
+- `crates/magpie_gpu_ptx` — PTX/NVVM backend (NVIDIA CUDA)
+- `crates/magpie_gpu_hip` — HIP/HSACO backend (AMD ROCm)
+- `crates/magpie_gpu_wgsl` — WGSL backend (WebGPU)
+- `crates/magpie_mlx` — MLX host API integration (Apple Silicon ML)
+- `crates/magpie_rt` — runtime library (ARC, GPU dispatch, profiling)
 - `crates/magpie_diag` — diagnostics + envelopes
 - `crates/magpie_csnf` — canonical formatter/digest handling
-- `crates/magpie_pkg`, `magpie_memory`, `magpie_ctx`, `magpie_web`, `magpie_gpu` — tooling and platform subsystems
+- `crates/magpie_pkg`, `magpie_memory`, `magpie_ctx`, `magpie_web` — tooling and platform subsystems
 
 Other important paths:
 - `tests/fixtures/` — language fixture programs, including `feature_harness.mp` and `tresult_parse_json.mp`
@@ -51,6 +63,13 @@ Required:
 Optional but recommended (for execution/link workflows):
 - `lli` (run LLVM IR via `magpie run` in dev workflows)
 - `llc` + `clang` + system linker (native executable emission/linking)
+
+Optional (for GPU backend compilation):
+- `llc` with NVPTX target (PTX backend) or AMDGPU target (HIP backend)
+- `ld.lld` (HIP HSACO linking)
+- Metal.framework (MSL backend, macOS only — auto-detected via `dlopen`)
+- Vulkan SDK (SPIR-V backend)
+- MLX framework (Apple Silicon ML — auto-detected via `dlopen`)
 
 ## Build the compiler
 
@@ -187,6 +206,38 @@ Top-level commands in `magpie`:
 - `ffi import`
 - `graph` (`symbols`, `deps`, `ownership`, `cfg`)
 
+## GPU multi-backend support
+
+Magpie supports 5 GPU compute backends via a unified `BackendEmitter` trait:
+
+| Backend | Emit kind | Target | Crate |
+|---------|-----------|--------|-------|
+| SPIR-V  | `spv`     | Vulkan | `magpie_gpu_spirv` |
+| MSL     | `msl`     | Metal (Apple) | `magpie_gpu_msl` |
+| PTX     | `ptx`     | CUDA (NVIDIA) | `magpie_gpu_ptx` |
+| HIP     | `hip`     | ROCm (AMD) | `magpie_gpu_hip` |
+| WGSL    | `wgsl`    | WebGPU | `magpie_gpu_wgsl` |
+
+The runtime probes backends at startup via `dlopen` in priority order: Metal > CUDA > HIP > Vulkan > WebGPU. Falls back to CPU simulation if no GPU is available.
+
+Configure GPU behavior in `Magpie.toml`:
+
+```toml
+[gpu]
+backend = "auto"       # auto | spirv | msl | ptx | hip | wgsl
+fallback = "cpu"       # cpu | error
+llc_path = "/usr/local/bin/llc"   # optional
+lld_path = "/usr/local/bin/ld.lld" # optional (HIP)
+```
+
+### MLX integration (Apple Silicon)
+
+The `magpie_mlx` crate provides full MLX host API integration via `dlopen`/`dlsym` dispatch tables (~40 function pointers). This enables ML workloads (array ops, neural network layers, optimizers, automatic differentiation) on Apple Silicon without requiring MLX to be a build-time dependency.
+
+### Monomorphization
+
+The `magpie_mono` crate implements generic specialization using BLAKE3-keyed instance hashing. Generic functions are duplicated and specialized per concrete type argument set, with deterministic SID (Symbol ID) assignment.
+
 ## Parse/JSON migration note
 
 Parse and JSON runtime ABI now has dual APIs:
@@ -233,3 +284,5 @@ Use `--output json` for machine-readable automation.
 - Language and semantics: `DOCUMENTATION.md`
 - Fast command cheatsheet: `DOCUMENTATION_QUICKSTART.md`
 - Deep compiler/diagnostic examples: `SKILL.md`
+- GPU expansion specification: `SPEC_GPU_UPGRADE.md`
+- GPU interoperability contracts: `GPU_INTEROP_SPEC.md`

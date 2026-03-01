@@ -107,10 +107,20 @@ commas     def,       match, borrow not
 - `crates/magpie_driver/src/lib.rs`
 - `crates/magpie_cli/src/main.rs`
 
+### Monomorphization
+- `crates/magpie_mono/src/lib.rs` -- BLAKE3-keyed generic specialization, SID generation
+
 ### Runtime/codegen backends
 - `crates/magpie_codegen_llvm/src/lib.rs`
-- `crates/magpie_rt/src/lib.rs`
-- `crates/magpie_gpu/src/lib.rs`
+- `crates/magpie_rt/src/lib.rs` -- runtime ABI, GPU dispatch (dlopen), profiling, MLX FFI
+- `crates/magpie_gpu/src/lib.rs` -- BackendEmitter trait, GpuBackend enum, kernel registry
+- `crates/magpie_gpu/src/structurize.rs` -- CFG structurizer (Relooper-style, for MSL/WGSL)
+- `crates/magpie_gpu_spirv/src/lib.rs` -- SPIR-V backend (Vulkan)
+- `crates/magpie_gpu_msl/src/lib.rs` -- Metal Shading Language backend
+- `crates/magpie_gpu_ptx/src/lib.rs` -- PTX/NVVM backend (CUDA)
+- `crates/magpie_gpu_hip/src/lib.rs` -- HIP/HSACO backend (AMD ROCm)
+- `crates/magpie_gpu_wgsl/src/lib.rs` -- WGSL backend (WebGPU)
+- `crates/magpie_mlx/src/lib.rs` -- MLX host API integration (Apple Silicon ML)
 - `crates/magpie_codegen_wasm/src/lib.rs` (when wasm path is relevant)
 
 ### Canonical examples
@@ -138,7 +148,8 @@ Core commands:
   - `cargo test --workspace`
 
 Useful emit kinds from driver planning:
-- `llvm-ir`, `llvm-bc`, `object`, `asm`, `spv`, `exe`, `shared-lib`, `mpir`, `mpd`, `mpdbg`, `symgraph`, `depsgraph`, `ownershipgraph`, `cfggraph`
+- `llvm-ir`, `llvm-bc`, `object`, `asm`, `exe`, `shared-lib`, `mpir`, `mpd`, `mpdbg`, `symgraph`, `depsgraph`, `ownershipgraph`, `cfggraph`
+- GPU: `spv` (SPIR-V/Vulkan), `msl` (Metal), `ptx` (CUDA/NVIDIA), `hip` (AMD/ROCm), `wgsl` (WebGPU)
 
 ---
 
@@ -222,7 +233,8 @@ Doc comments (`;;`) may precede declarations and are attached.
 fn_decl         := "fn" fn_name "(" params ")" "->" type meta_opt blocks
 async_fn_decl   := "async" "fn" ...
 unsafe_fn_decl  := "unsafe" "fn" ...
-gpu_fn_decl     := "gpu" "fn" ... "target" "(" ident ")" meta_opt blocks
+gpu_fn_decl     := "gpu" "fn" ... "target" "(" ident ")" gpu_attrs? meta_opt blocks
+;; gpu_attrs: is_unsafe (bool), workgroup ([u32;3]), requires (Vec<String>)
 ```
 
 ### Function meta
@@ -306,7 +318,7 @@ Parser accepts these as leading keywords.
 
 ## 5.2 Primitive types
 
-`i1 i8 i16 i32 i64 i128 u1 u8 u16 u32 u64 u128 f16 f32 f64 bool unit`
+`i1 i8 i16 i32 i64 i128 u1 u8 u16 u32 u64 u128 f16 f32 f64 bf16 bool unit`
 
 ## 5.3 Builtin types
 
@@ -492,15 +504,15 @@ Use exactly these names and keys.
 - `json.decode<Type> { s=V }`
 
 ### GPU value ops
-- `gpu.thread_id { dim=V }`
-- `gpu.workgroup_id { dim=V }`
-- `gpu.workgroup_size { dim=V }`
-- `gpu.global_id { dim=V }`
+- `gpu.thread_id { dim=V }` (dim: 0=x, 1=y, 2=z)
+- `gpu.workgroup_id { dim=V }` (dim: 0=x, 1=y, 2=z)
+- `gpu.workgroup_size { dim=V }` (dim: 0=x, 1=y, 2=z)
+- `gpu.global_id { dim=V }` (dim: 0=x, 1=y, 2=z)
 - `gpu.buffer_load<Type> { buf=V, idx=V }`
 - `gpu.buffer_len<Type> { buf=V }`
 - `gpu.shared<count, Type>`
-- `gpu.launch { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }` (**strict key order**)
-- `gpu.launch_async { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }` (**strict key order**)
+- `gpu.launch { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }` (**strict key order**, grid/block are 3D: `[x, y, z]`)
+- `gpu.launch_async { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }` (**strict key order**, grid/block are 3D: `[x, y, z]`)
 
 ## 6.2 Void ops
 
@@ -847,7 +859,7 @@ Driver stage names (actual constants):
 8. `stage7_verify_mpir`
 9. `stage8_arc_insertion`
 10. `stage9_arc_optimization`
-11. `stage10_codegen`
+11. `stage10_codegen` (LLVM IR + GPU backend dispatch: SPIR-V/MSL/PTX/HIP/WGSL)
 12. `stage11_link`
 13. `stage12_mms_update`
 
@@ -869,7 +881,7 @@ stage5 (ownership)        | MPO0003, MPO0004        | MPO0007, MPO0011
 stage6 (lower MPIR)       | MPS0008-0016            | MPM0001
 stage7 (verify MPIR)      | MPS0008-0016            | MPS0001-0003
 stage8-9 (ARC)            | MPS0014 (if pre-ARC)    | --
-stage10 (codegen)         | MPG* (backend-specific) | --
+stage10 (codegen)         | MPG* (backend-specific) | MPG_TYP_*, MPG_KRN_*, MPG_BUF_*
 stage11 (link)            | MPLINK01, MPLINK02      | MPL0001, MPL0002
 stage12 (mms)             | --                      | MPL0801, MPL0802
 lint pass                 | MPL2001-MPL2021         | (any stage, policy-driven)
@@ -1236,6 +1248,51 @@ Projection result semantics (ownership layer):
 
 When adding GPU semantics, extend sema/ownership checks explicitly; current static checking is lighter than core collection/struct ops.
 
+### 17.10.1 GPU multi-backend codegen
+
+The driver routes `gpu fn` kernels to per-backend emitters based on the `target()` annotation or `[gpu].backend` manifest config:
+
+| Backend | Emitter crate | Output format | Control flow |
+|---------|--------------|---------------|--------------|
+| SPIR-V  | `magpie_gpu_spirv` | Binary SPIR-V module | Native (unstructured CFG) |
+| MSL     | `magpie_gpu_msl` | Metal Shading Language text | Structurized (Relooper) |
+| PTX     | `magpie_gpu_ptx` | LLVM IR (nvptx64 triple) → PTX via llc | Native |
+| HIP     | `magpie_gpu_hip` | LLVM IR (amdgcn triple) → HSACO via llc+lld | Native |
+| WGSL    | `magpie_gpu_wgsl` | WGSL text | Structurized (Relooper) |
+
+MSL and WGSL require structured control flow; the CFG structurizer (`magpie_gpu::structurize`) converts MPIR basic blocks into `IfElse`/`Loop`/`Break`/`Continue` nodes before emission.
+
+### 17.10.2 GPU runtime dispatch
+
+The runtime probes GPU backends at startup via `dlopen` in priority order: Metal.framework > libcuda.so > libamdhip64.so > libvulkan.so > libwgpu_native.so. Falls back to CPU simulation when no GPU is found.
+
+Key runtime ABI functions:
+- `mp_rt_gpu_init()` — probe and initialize GPU dispatch
+- `mp_rt_gpu_device_count()` / `mp_rt_gpu_device_default()` / `mp_rt_gpu_device_by_index()` — device discovery
+- `mp_rt_gpu_device_name()` / `mp_rt_gpu_device_backends()` / `mp_rt_gpu_device_max_workgroup_size()` — capability queries
+- `mp_rt_gpu_buffer_new()` / `mp_rt_gpu_buffer_from_array()` / `mp_rt_gpu_buffer_to_array()` — buffer management
+- `mp_rt_gpu_launch_sync()` / `mp_rt_gpu_launch_async()` / `mp_rt_gpu_fence_wait()` — kernel dispatch
+- `mp_rt_gpu_device_sync()` — device synchronization
+
+### 17.10.3 GPU profiling
+
+Runtime profiling ABI (9 functions):
+- `mp_rt_gpu_profile_begin()` / `mp_rt_gpu_profile_end()` — session lifecycle
+- `mp_rt_gpu_profile_mark_begin()` / `mp_rt_gpu_profile_mark_end()` — region markers
+- `mp_rt_gpu_profile_export_chrome()` — Chrome trace JSON export (`chrome://tracing` compatible)
+- `mp_rt_gpu_profile_available_counters()` / `mp_rt_gpu_profile_enable_counters()` / `mp_rt_gpu_profile_read_counters()` — hardware counters
+- `mp_rt_gpu_profile_memory_stats()` — GPU allocation tracking (bytes allocated/peak/count)
+
+### 17.10.4 MLX integration
+
+`magpie_mlx` provides Apple Silicon ML acceleration via `dlopen`/`dlsym` dispatch tables (~40 function pointers). Key `mp_rt_mlx_*` C-ABI entrypoints:
+- Array lifecycle: `array_from_data`, `array_shape`, `array_eval`, `array_to_data`
+- Element-wise ops: `add`, `subtract`, `multiply`, `divide`, `matmul`
+- Neural network: `linear`, `conv2d`, `relu`, `gelu`, `softmax`, `layer_norm`, `batch_norm`
+- Optimization: `sgd_step`, `adamw_step`
+- Automatic differentiation: `grad`, `value_and_grad`
+- Reduction: `sum`, `mean`, `max`, `min`, `argmax`, `argmin`
+
 ### 17.11 Phi/control-flow contracts
 
 | Construct | Contract | Enforced by |
@@ -1387,6 +1444,14 @@ Use this when diagnosing "use of moved value" (`MPO0007`) vs "move while borrowe
 | MPL2007    | lint          | Unreachable code                                      |
 | MPL2020    | lint          | Monomorphization pressure too high                    |
 | MPL2021    | lint          | Mixed generics mode conflict                          |
+| MPG_TYP_*  | GPU codegen   | GPU type errors (bf16 unsupported on backend, etc.)   |
+| MPG_KRN_*  | GPU codegen   | Kernel validation errors (workgroup size, buffer count)|
+| MPG_BUF_*  | GPU codegen   | GPU buffer errors (type mismatch, out of bounds)      |
+| MPG_SYN_*  | GPU codegen   | GPU sync errors (barrier misuse, fence errors)        |
+| MPG_CAP_*  | GPU codegen   | GPU capability errors (missing backend feature)       |
+| MPG_LNK_*  | GPU codegen   | GPU link errors (llc/lld not found, compilation fail) |
+| MPG_MLX_*  | MLX           | MLX dispatch errors (dlopen fail, missing symbol)     |
+| MPG_PRF_*  | GPU profiling | Profiling errors (session not started, export fail)   |
 
 ---
 
