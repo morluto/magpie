@@ -1404,7 +1404,11 @@ pub unsafe extern "C" fn mp_rt_str_try_parse_i64(
     let src = match str_to_rust_str_try(s) {
         Ok(src) => src,
         Err(code) => {
-            set_out_error(out_errmsg, "str.try_parse_i64: invalid utf-8");
+            if code == MP_RT_ERR_NULL_INPUT {
+                set_out_error(out_errmsg, "str.try_parse_i64: null input");
+            } else {
+                set_out_error(out_errmsg, "str.try_parse_i64: invalid utf-8");
+            }
             return code;
         }
     };
@@ -1462,7 +1466,11 @@ pub unsafe extern "C" fn mp_rt_str_try_parse_u64(
     let src = match str_to_rust_str_try(s) {
         Ok(src) => src,
         Err(code) => {
-            set_out_error(out_errmsg, "str.try_parse_u64: invalid utf-8");
+            if code == MP_RT_ERR_NULL_INPUT {
+                set_out_error(out_errmsg, "str.try_parse_u64: null input");
+            } else {
+                set_out_error(out_errmsg, "str.try_parse_u64: invalid utf-8");
+            }
             return code;
         }
     };
@@ -1506,7 +1514,11 @@ pub unsafe extern "C" fn mp_rt_str_try_parse_f64(
     let src = match str_to_rust_str_try(s) {
         Ok(src) => src,
         Err(code) => {
-            set_out_error(out_errmsg, "str.try_parse_f64: invalid utf-8");
+            if code == MP_RT_ERR_NULL_INPUT {
+                set_out_error(out_errmsg, "str.try_parse_f64: null input");
+            } else {
+                set_out_error(out_errmsg, "str.try_parse_f64: invalid utf-8");
+            }
             return code;
         }
     };
@@ -1550,7 +1562,11 @@ pub unsafe extern "C" fn mp_rt_str_try_parse_bool(
     let src = match str_to_rust_str_try(s) {
         Ok(src) => src,
         Err(code) => {
-            set_out_error(out_errmsg, "str.try_parse_bool: invalid utf-8");
+            if code == MP_RT_ERR_NULL_INPUT {
+                set_out_error(out_errmsg, "str.try_parse_bool: null input");
+            } else {
+                set_out_error(out_errmsg, "str.try_parse_bool: invalid utf-8");
+            }
             return code;
         }
     };
@@ -1644,7 +1660,11 @@ pub unsafe extern "C" fn mp_rt_json_try_encode(
             let s = match str_to_rust_str_try(obj as *mut MpRtHeader) {
                 Ok(s) => s,
                 Err(code) => {
-                    set_out_error(out_errmsg, "json.try_encode: invalid utf-8 string");
+                    if code == MP_RT_ERR_NULL_INPUT {
+                        set_out_error(out_errmsg, "json.try_encode: null string input");
+                    } else {
+                        set_out_error(out_errmsg, "json.try_encode: invalid utf-8 string");
+                    }
                     return code;
                 }
             };
@@ -1693,7 +1713,11 @@ pub unsafe extern "C" fn mp_rt_json_try_decode(
     let src = match str_to_rust_str_try(json_str) {
         Ok(src) => src.trim(),
         Err(code) => {
-            set_out_error(out_errmsg, "json.try_decode: invalid utf-8 input");
+            if code == MP_RT_ERR_NULL_INPUT {
+                set_out_error(out_errmsg, "json.try_decode: null input");
+            } else {
+                set_out_error(out_errmsg, "json.try_decode: invalid utf-8 input");
+            }
             return code;
         }
     };
@@ -4929,6 +4953,22 @@ mod tests {
     }
 
     #[test]
+    fn test_str_try_parse_i64_null_input_reports_null_input() {
+        unsafe {
+            let mut out: i64 = 99;
+            let mut out_err: *mut MpRtHeader = std::ptr::null_mut();
+
+            let status = mp_rt_str_try_parse_i64(std::ptr::null_mut(), &mut out, &mut out_err);
+            assert_eq!(status, MP_RT_ERR_NULL_INPUT);
+            assert_eq!(out, 99);
+            assert!(!out_err.is_null());
+            assert!(read_str(out_err).contains("null input"));
+
+            mp_rt_release_strong(out_err);
+        }
+    }
+
+    #[test]
     fn test_str_try_parse_i64_null_out_pointer() {
         unsafe {
             let s = make_str("1");
@@ -5104,6 +5144,27 @@ mod tests {
 
             mp_rt_release_strong(out_err);
             mp_rt_release_strong(bad_json);
+        }
+    }
+
+    #[test]
+    fn test_json_try_decode_null_input_reports_null_input() {
+        unsafe {
+            let mut out_val: *mut u8 = std::ptr::null_mut();
+            let mut out_err: *mut MpRtHeader = std::ptr::null_mut();
+
+            let status = mp_rt_json_try_decode(
+                std::ptr::null_mut(),
+                TYPE_ID_I32,
+                &mut out_val,
+                &mut out_err,
+            );
+            assert_eq!(status, MP_RT_ERR_NULL_INPUT);
+            assert!(out_val.is_null());
+            assert!(!out_err.is_null());
+            assert!(read_str(out_err).contains("null input"));
+
+            mp_rt_release_strong(out_err);
         }
     }
 
