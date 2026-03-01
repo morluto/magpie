@@ -28,6 +28,7 @@ use magpie_hir::{
 };
 use magpie_lex::lex;
 use magpie_memory::{build_index_with_sources, MmsItem, MmsSourceFingerprint};
+use magpie_mono::monomorphize;
 use magpie_mpir::{
     print_mpir, verify_mpir, MpirBlock, MpirFn, MpirGpuMeta, MpirInstr, MpirLocalDecl, MpirModule,
     MpirOp, MpirOpVoid, MpirTerminator, MpirTypeTable, MpirValue,
@@ -48,6 +49,7 @@ use serde_json::json;
 mod magpie_codegen_llvm;
 
 const DEFAULT_MAX_ERRORS: usize = 20;
+const DEFAULT_MAX_MONO_INSTANCES: u32 = 10_000;
 pub const DEFAULT_LLM_TOKEN_BUDGET: u32 = 12_000;
 pub const DEFAULT_LLM_TOKENIZER: &str = "approx:utf8_4chars";
 pub const DEFAULT_LLM_BUDGET_POLICY: &str = "balanced";
@@ -390,6 +392,32 @@ fn resolve_manifest_build_entry(entry_path: &str) -> Option<String> {
     Some(resolved.to_string_lossy().to_string())
 }
 
+fn resolve_manifest_max_mono_instances(entry_path: &str, diag: &mut DiagnosticBag) -> Option<u32> {
+    let manifest_path = discover_manifest_path(entry_path).or_else(discover_manifest_from_cwd)?;
+    let manifest = match magpie_pkg::parse_manifest(&manifest_path) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            emit_driver_diag(
+                diag,
+                "MPT0000",
+                Severity::Warning,
+                "manifest parse failed",
+                format!(
+                    "Failed to parse manifest '{}' while resolving build.max_mono_instances (using default {}): {}",
+                    manifest_path.display(),
+                    DEFAULT_MAX_MONO_INSTANCES,
+                    err
+                ),
+            );
+            return None;
+        }
+    };
+    manifest
+        .build
+        .max_mono_instances
+        .map(|value| value.clamp(1, u32::MAX as u64) as u32)
+}
+
 fn parse_gpu_config(toml_value: &toml::Value) -> GpuConfig {
     let mut config = GpuConfig::default();
     config.fallback = "none".to_string();
@@ -646,10 +674,27 @@ pub fn build(config: &DriverConfig) -> BuildResult {
     // Stage 3.5: async lowering.
     {
         let start = Instant::now();
+        let mut diag = DiagnosticBag::new(max_errors);
         lower_async_functions(&mut hir_modules, &mut type_ctx);
+        if !config.shared_generics {
+            let max_mono_instances =
+                resolve_manifest_max_mono_instances(&config.entry_path, &mut diag)
+                    .unwrap_or(DEFAULT_MAX_MONO_INSTANCES);
+            match monomorphize(&hir_modules, &mut type_ctx, max_mono_instances, &mut diag) {
+                Ok(monomorphized) => {
+                    hir_modules = monomorphized;
+                }
+                Err(()) => {}
+            }
+        }
         result
             .timing_ms
             .insert(STAGE_35.to_string(), elapsed_ms(start));
+        let stage_failed = append_stage_diagnostics(&mut result, diag);
+        if stage_failed {
+            mark_skipped_from(&mut result.timing_ms, 4);
+            return finalize_build_result(result, config);
+        }
     }
 
     let type_id_remap = type_ctx.finalize_type_ids_with_remap();
@@ -7377,5 +7422,217 @@ bb0:
         assert_eq!(result.passed, 0);
         assert_eq!(result.failed, 0);
         assert!(result.test_names.is_empty());
+    }
+
+    #[test]
+    fn build_wires_monomorphization_and_emits_specialized_function_instance() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "magpie_driver_mono_wiring_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        let entry_path = temp_dir.join("mono_wiring.mp");
+        std::fs::write(
+            &entry_path,
+            r#"module mono.wiring
+exports { @main, @id }
+imports { }
+digest "0000000000000000"
+
+fn @id(%x: i32) -> i32 {
+bb0:
+  ret %x
+}
+
+fn @main() -> i32 {
+bb0:
+  %v: i32 = call @id<i32> { x=const.i32 7 }
+  ret %v
+}
+"#,
+        )
+        .expect("failed to write source");
+
+        let mut config = DriverConfig::default();
+        config.entry_path = entry_path.to_string_lossy().to_string();
+        config.target_triple = format!("mono-wiring-test-{}-{}", std::process::id(), nonce);
+        config.emit = vec!["mpir".to_string()];
+
+        let result = build(&config);
+        assert!(
+            result.success,
+            "monomorphization wiring source should build, diagnostics: {:?}",
+            result.diagnostics
+        );
+        let mpir_path = stage_module_output_path(&config, 0, 1, "mpir");
+        let mpir_text = std::fs::read_to_string(&mpir_path).expect("mpir artifact should exist");
+        assert!(
+            mpir_text.contains("$I$"),
+            "expected specialized function SID/name to be emitted in MPIR, got:\n{}",
+            mpir_text
+        );
+        let specialized_sid_re =
+            Regex::new(r#"fn @@id\$I\$[0-9a-f]+.* sid \"([A-Z]:[A-Z0-9]{10})\""#)
+                .expect("specialized SID regex should compile");
+        let specialized_sid = specialized_sid_re
+            .captures(&mpir_text)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .expect("expected specialized function SID capture from MPIR");
+
+        assert!(
+            mpir_text.contains(&format!("call sid \"{}\" {{ targs=[]", specialized_sid)),
+            "expected callsite to target specialized instance SID `{}`; got:\n{}",
+            specialized_sid,
+            mpir_text
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(&config.target_triple));
+    }
+
+    #[test]
+    fn build_reads_manifest_max_mono_instances_budget() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "magpie_driver_mono_budget_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("failed to create source dir");
+
+        std::fs::write(
+            root.join("Magpie.toml"),
+            r#"[package]
+name = "mono_budget"
+version = "0.1.0"
+edition = "2026"
+
+[build]
+entry = "src/main.mp"
+profile_default = "dev"
+max_mono_instances = 1
+"#,
+        )
+        .expect("failed to write manifest");
+
+        std::fs::write(
+            root.join("src/main.mp"),
+            r#"module mono.budget
+exports { @main, @id }
+imports { }
+digest "0000000000000000"
+
+fn @id(%x: i32) -> i32 {
+bb0:
+  ret %x
+}
+
+fn @main() -> i32 {
+bb0:
+  %a: i32 = call @id<i32> { x=const.i32 1 }
+  %b: i32 = call @id<i64> { x=const.i32 2 }
+  %sum: i32 = i.add { lhs=%a, rhs=%b }
+  ret %sum
+}
+"#,
+        )
+        .expect("failed to write source");
+
+        let mut config = DriverConfig::default();
+        config.entry_path = root.join("src/main.mp").to_string_lossy().to_string();
+        config.target_triple = format!("mono-budget-test-{}-{}", std::process::id(), nonce);
+        config.emit = vec!["mpir".to_string()];
+
+        let result = build(&config);
+        assert!(
+            !result.success,
+            "max_mono_instances=1 should fail for two distinct instantiations"
+        );
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "MPL2020"),
+            "expected MPL2020 diagnostic, got {:?}",
+            result.diagnostics
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(&config.target_triple));
+    }
+
+    #[test]
+    fn resolve_manifest_max_mono_instances_warns_on_manifest_parse_failure() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "magpie_driver_mono_budget_manifest_parse_fail_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("failed to create source dir");
+
+        std::fs::write(
+            root.join("Magpie.toml"),
+            r#"[package]
+name = "mono_budget_parse_fail"
+version = "0.1.0"
+edition = "2026"
+
+[build]
+entry = "src/main.mp"
+profile_default = "dev"
+max_mono_instances = "invalid_not_integer"
+"#,
+        )
+        .expect("failed to write manifest");
+
+        std::fs::write(
+            root.join("src/main.mp"),
+            r#"module mono.budget.parse.fail
+exports { @main, @id }
+imports { }
+digest "0000000000000000"
+
+fn @id(%x: i32) -> i32 {
+bb0:
+  ret %x
+}
+
+fn @main() -> i32 {
+bb0:
+  %v: i32 = call @id<i32> { x=const.i32 7 }
+  ret %v
+}
+"#,
+        )
+        .expect("failed to write source");
+
+        let entry_path = root.join("src/main.mp").to_string_lossy().to_string();
+        let mut diag = DiagnosticBag::new(20);
+        let result = resolve_manifest_max_mono_instances(&entry_path, &mut diag);
+        assert!(
+            result.is_none(),
+            "invalid manifest should resolve to no max_mono_instances override"
+        );
+        assert!(
+            diag.diagnostics.iter().any(|d| {
+                d.code == "MPT0000"
+                    && matches!(d.severity, Severity::Warning)
+                    && d.message.contains("build.max_mono_instances")
+            }),
+            "expected warning diagnostic for manifest parse failure when resolving mono budget; got {:?}",
+            diag.diagnostics
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

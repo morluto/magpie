@@ -69,8 +69,17 @@ pub fn monomorphize(
                 return Err(());
             }
 
+            let inst = instance_id(&template.sid, &key.type_args, type_ctx);
             let mut specialized = specialize_function(&template, &key.type_args, type_ctx);
             specialized.fn_id = next_fn_id(&out_modules[owner_module_idx]);
+            specialized.sid =
+                match select_unique_specialized_sid(&template.sid, &inst, &template_by_sid) {
+                    Some(sid) => sid,
+                    None => {
+                        emit_mono_sid_exhausted(diag, &template.sid, &inst);
+                        return Err(());
+                    }
+                };
 
             let new_sid = specialized.sid.clone();
             out_modules[owner_module_idx]
@@ -113,6 +122,26 @@ fn emit_excessive_mono(diag: &mut DiagnosticBag, max_instances: u32) {
         code: codes::MPL2020.to_string(),
         severity: Severity::Error,
         title: "EXCESSIVE_MONO".to_string(),
+        primary_span: None,
+        secondary_spans: vec![],
+        message: msg,
+        explanation_md: None,
+        why: None,
+        suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
+    });
+}
+
+fn emit_mono_sid_exhausted(diag: &mut DiagnosticBag, base_sid: &Sid, inst_id: &str) {
+    let msg = format!(
+        "Unable to allocate a unique specialization SID for base_sid='{}' inst_id='{}' after collision retries.",
+        base_sid.0, inst_id
+    );
+    diag.emit(Diagnostic {
+        code: codes::MPL2020.to_string(),
+        severity: Severity::Error,
+        title: "MONO_SID_EXHAUSTED".to_string(),
         primary_span: None,
         secondary_spans: vec![],
         message: msg,
@@ -343,8 +372,52 @@ fn instance_id(callee_sid: &Sid, type_args: &[TypeId], type_ctx: &TypeCtx) -> St
 }
 
 fn specialized_sid(base_sid: &Sid, inst_id: &str) -> Sid {
-    let suffix = inst_id.strip_prefix("I:").unwrap_or(inst_id);
-    Sid(format!("{}$I${}", base_sid.0, suffix))
+    specialized_sid_with_salt(base_sid, inst_id, 0)
+}
+
+fn specialized_sid_with_salt(base_sid: &Sid, inst_id: &str, salt: u32) -> Sid {
+    let kind = base_sid
+        .0
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, 'M' | 'F' | 'T' | 'G' | 'E'))
+        .unwrap_or('F');
+    let payload = if salt == 0 {
+        format!("magpie:mono-sid:v0.1|{}|{}", base_sid.0, inst_id)
+    } else {
+        format!(
+            "magpie:mono-sid:v0.1|{}|{}|salt:{}",
+            base_sid.0, inst_id, salt
+        )
+    };
+    let digest_hex = blake3_hex_best_effort(&payload);
+    let mut suffix: String = digest_hex
+        .chars()
+        .take(10)
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect();
+    if suffix.len() < 10 {
+        suffix.push_str(&"0".repeat(10 - suffix.len()));
+    }
+    Sid(format!("{}:{}", kind, suffix))
+}
+
+fn select_unique_specialized_sid(
+    base_sid: &Sid,
+    inst_id: &str,
+    occupied: &HashMap<String, (usize, HirFunction)>,
+) -> Option<Sid> {
+    let primary = specialized_sid(base_sid, inst_id);
+    if !occupied.contains_key(&primary.0) {
+        return Some(primary);
+    }
+    for salt in 1..=u32::MAX {
+        let candidate = specialized_sid_with_salt(base_sid, inst_id, salt);
+        if !occupied.contains_key(&candidate.0) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn specialized_name(base_name: &str, inst_id: &str) -> String {
@@ -1077,14 +1150,48 @@ mod tests {
         assert_eq!(inst_a.len(), 18);
 
         let specialized_sid_value = specialized_sid(&sid, &inst_a);
+        let specialized_sid_again = specialized_sid(&sid, &inst_a);
         let specialized_name_value = specialized_name("generic.add", &inst_a);
-        assert_eq!(
-            specialized_sid_value.0,
-            format!("{}$I${}", sid.0, inst_a.trim_start_matches("I:"))
-        );
+        assert_eq!(specialized_sid_value, specialized_sid_again);
+        assert_eq!(specialized_sid_value.0.len(), 12);
+        assert_eq!(specialized_sid_value.0.chars().nth(1), Some(':'));
+        assert!(specialized_sid_value.0.starts_with("F:"));
         assert_eq!(
             specialized_name_value,
             format!("generic.add$I${}", inst_a.trim_start_matches("I:"))
         );
+    }
+
+    #[test]
+    fn select_unique_specialized_sid_retries_on_collision() {
+        let base_sid = Sid("F:ABCDEF1234".to_string());
+        let inst = "I:0011223344556677";
+        let primary = specialized_sid(&base_sid, inst);
+
+        let placeholder_fn = HirFunction {
+            fn_id: FnId(999),
+            sid: primary.clone(),
+            name: "placeholder".to_string(),
+            params: vec![(magpie_hir::LocalId(0), TypeId(0))],
+            ret_ty: TypeId(0),
+            blocks: vec![HirBlock {
+                id: magpie_hir::BlockId(0),
+                instrs: vec![],
+                void_ops: vec![],
+                terminator: HirTerminator::Ret(None),
+            }],
+            is_async: false,
+            is_unsafe: false,
+        };
+
+        let mut occupied = HashMap::new();
+        occupied.insert(primary.0.clone(), (0, placeholder_fn));
+
+        let selected = select_unique_specialized_sid(&base_sid, inst, &occupied)
+            .expect("should produce a collision-free SID");
+        assert_ne!(selected, primary);
+        assert!(!occupied.contains_key(&selected.0));
+        assert_eq!(selected.0.len(), 12);
+        assert_eq!(selected.0.chars().nth(1), Some(':'));
     }
 }
