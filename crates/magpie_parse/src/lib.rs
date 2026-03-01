@@ -1828,9 +1828,17 @@ impl<'a, 'd> Parser<'a, 'd> {
 
     fn parse_base_type(&mut self) -> Option<AstBaseType> {
         match self.peek().kind {
-            TokenKind::Ident | TokenKind::Async | TokenKind::Unsafe | TokenKind::Gpu
-            | TokenKind::Target | TokenKind::Workgroup | TokenKind::Requires | TokenKind::Heap
-            | TokenKind::Value | TokenKind::Fn | TokenKind::Meta => {
+            TokenKind::Ident
+            | TokenKind::Async
+            | TokenKind::Unsafe
+            | TokenKind::Gpu
+            | TokenKind::Target
+            | TokenKind::Workgroup
+            | TokenKind::Requires
+            | TokenKind::Heap
+            | TokenKind::Value
+            | TokenKind::Fn
+            | TokenKind::Meta => {
                 let text = if self.at(TokenKind::Ident) {
                     self.peek().text.clone()
                 } else {

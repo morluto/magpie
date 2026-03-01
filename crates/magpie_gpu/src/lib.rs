@@ -1844,3 +1844,101 @@ fn llvm_kernel_param_const(param: &KernelParam) -> String {
         param.kind as u8, param.type_id, param.offset_or_binding, param.size
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_layout() -> KernelLayout {
+        KernelLayout {
+            params: vec![
+                KernelParam {
+                    kind: KernelParamKind::Buffer,
+                    type_id: 0,
+                    offset_or_binding: 0,
+                    size: 0,
+                },
+                KernelParam {
+                    kind: KernelParamKind::Scalar,
+                    type_id: 4,
+                    offset_or_binding: 0,
+                    size: 4,
+                },
+            ],
+            num_buffers: 1,
+            push_const_size: 16,
+        }
+    }
+
+    #[test]
+    fn kernel_registry_groups_multi_blob_entries_by_sid() {
+        let layout = sample_layout();
+        let kernels = vec![
+            (
+                "F:test.kernels.@a".to_string(),
+                GpuBackend::Spv as u8,
+                layout.clone(),
+                vec![0x01, 0x02, 0x03, 0x04],
+            ),
+            (
+                "F:test.kernels.@a".to_string(),
+                GpuBackend::Msl as u8,
+                layout.clone(),
+                vec![0x05, 0x06],
+            ),
+            (
+                "F:test.kernels.@b".to_string(),
+                GpuBackend::Wgsl as u8,
+                layout,
+                vec![0xAA],
+            ),
+        ];
+
+        let ir = generate_kernel_registry_ir(&kernels);
+        assert!(ir.contains("%MpRtGpuKernelBlob = type"));
+        assert!(ir.contains("%MpRtGpuKernelEntry = type"));
+        assert!(ir.contains("@mp_gpu_kernel_registry"));
+
+        let entry_count = ir.matches("%MpRtGpuKernelEntry { i64").count();
+        assert_eq!(entry_count, 2, "expected one entry per unique SID");
+
+        let sid_a_hash = sid_hash_64(&Sid("F:test.kernels.@a".to_string()));
+        let sid_b_hash = sid_hash_64(&Sid("F:test.kernels.@b".to_string()));
+        assert!(ir.contains(&format!("i64 {sid_a_hash}")));
+        assert!(ir.contains(&format!("i64 {sid_b_hash}")));
+
+        assert!(
+            ir.contains("i32 2, i32 0, ptr getelementptr inbounds ([2 x %MpRtGpuKernelBlob], ptr @mp_gpu_kernel_blobs_0"),
+            "expected two blobs for first SID; ir=\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("i32 1, i32 0, ptr getelementptr inbounds ([1 x %MpRtGpuKernelBlob], ptr @mp_gpu_kernel_blobs_1"),
+            "expected one blob for second SID; ir=\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn kernel_registry_ir_is_deterministic_for_same_input() {
+        let layout = sample_layout();
+        let kernels = vec![
+            (
+                "F:test.kernels.@z".to_string(),
+                GpuBackend::Spv as u8,
+                layout.clone(),
+                vec![0x10, 0x20],
+            ),
+            (
+                "F:test.kernels.@a".to_string(),
+                GpuBackend::Msl as u8,
+                layout,
+                vec![0x30],
+            ),
+        ];
+
+        let a = generate_kernel_registry_ir(&kernels);
+        let b = generate_kernel_registry_ir(&kernels);
+        assert_eq!(a, b, "registry IR generation must be deterministic");
+    }
+}

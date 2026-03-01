@@ -54,7 +54,7 @@ impl MslEmitter {
         // Emit parameters with Metal attributes
         let mut binding = 0u32;
         let mut params_emitted = false;
-        for (i, (_, ty_id)) in kernel.params.iter().enumerate() {
+        for (local_id, ty_id) in &kernel.params {
             if params_emitted {
                 write!(out, ", ").map_err(|e| e.to_string())?;
             }
@@ -62,8 +62,8 @@ impl MslEmitter {
             if is_buffer {
                 write!(
                     out,
-                    "device float* param_{i} [[buffer({binding})]]",
-                    i = i,
+                    "device float* _l{local_id} [[buffer({binding})]]",
+                    local_id = local_id.0,
                     binding = binding
                 )
                 .map_err(|e| e.to_string())?;
@@ -71,9 +71,9 @@ impl MslEmitter {
                 let msl_ty = msl_type_name(type_ctx, *ty_id);
                 write!(
                     out,
-                    "constant {ty}& param_{i} [[buffer({binding})]]",
+                    "constant {ty}& _l{local_id} [[buffer({binding})]]",
                     ty = msl_ty,
-                    i = i,
+                    local_id = local_id.0,
                     binding = binding
                 )
                 .map_err(|e| e.to_string())?;
@@ -124,7 +124,10 @@ fn msl_kernel_name(name: &str) -> String {
 
 fn is_gpu_buffer(type_ctx: &TypeCtx, ty_id: TypeId) -> bool {
     ty_id == magpie_types::fixed_type_ids::GPU_BUFFER_BASE
-        || matches!(type_ctx.lookup(ty_id), Some(TypeKind::HeapHandle { .. }))
+        || matches!(
+            type_ctx.lookup(ty_id),
+            Some(TypeKind::HeapHandle { .. } | TypeKind::RawPtr { .. })
+        )
 }
 
 fn msl_type_name(type_ctx: &TypeCtx, ty_id: TypeId) -> &'static str {

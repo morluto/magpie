@@ -1889,6 +1889,7 @@ pub unsafe extern "C" fn mp_rt_mlx_random_seed(seed: u64, out_err: *mut *mut MpR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
 
     #[test]
     fn mlx_dtype_from_type_id() {
@@ -1910,5 +1911,132 @@ mod tests {
             let result = mlx_array_zeros(MlxDtype::F32, &[2, 3]);
             assert!(result.is_err());
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn require_mlx_runtime() -> bool {
+        if !mlx_init() {
+            eprintln!("skipping MLX execution test: mlx_init() failed");
+            return false;
+        }
+        if !mlx_is_available() {
+            eprintln!("skipping MLX execution test: MLX runtime is unavailable");
+            return false;
+        }
+        true
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_exec_array_linalg_random_and_optimizer_paths() {
+        if !require_mlx_runtime() {
+            return;
+        }
+
+        let one = mlx_array_ones(MlxDtype::F32, &[2, 3]).expect("ones should succeed");
+        let fill: f32 = 2.0;
+        let full = mlx_array_full(MlxDtype::F32, &[2, 3], &fill as *const f32 as *const c_void)
+            .expect("full should succeed");
+        let add = mlx_array_add(&one, &full).expect("add should succeed");
+        assert_eq!(
+            mlx_array_shape(&add).expect("shape should succeed"),
+            vec![2, 3]
+        );
+        assert_eq!(mlx_array_size(&add).expect("size should succeed"), 6);
+
+        let reshaped = mlx_array_reshape(&add, &[3, 2]).expect("reshape should succeed");
+        assert_eq!(
+            mlx_array_shape(&reshaped).expect("shape should succeed"),
+            vec![3, 2]
+        );
+
+        let rhs = mlx_array_ones(MlxDtype::F32, &[2, 4]).expect("rhs should succeed");
+        let mat = mlx_array_matmul(&reshaped, &rhs).expect("matmul should succeed");
+        assert_eq!(
+            mlx_array_shape(&mat).expect("shape should succeed"),
+            vec![3, 4]
+        );
+
+        let sum = mlx_array_sum(&mat, 1).expect("sum should succeed");
+        let mean = mlx_array_mean(&mat, 0).expect("mean should succeed");
+        mlx_array_eval(&sum).expect("sum eval should succeed");
+        mlx_array_eval(&mean).expect("mean eval should succeed");
+
+        let optim = mlx_optim_adam(1e-3).expect("adam should succeed");
+        let grad = mlx_array_ones(MlxDtype::F32, &[3, 4]).expect("grad should succeed");
+        mlx_optim_step(&optim, &mat, &grad).expect("optimizer step should succeed");
+
+        let normal =
+            mlx_random_normal(MlxDtype::F32, &[2, 2]).expect("random_normal should succeed");
+        let uniform = mlx_random_uniform(MlxDtype::F32, &[2, 2], -1.0, 1.0)
+            .expect("random_uniform should succeed");
+        assert_eq!(
+            mlx_array_shape(&normal).expect("shape should succeed"),
+            vec![2, 2]
+        );
+        assert_eq!(
+            mlx_array_shape(&uniform).expect("shape should succeed"),
+            vec![2, 2]
+        );
+        mlx_array_eval(&normal).expect("normal eval should succeed");
+        mlx_array_eval(&uniform).expect("uniform eval should succeed");
+
+        if let Err(err) = mlx_random_seed(42) {
+            assert_eq!(
+                err.kind, 7,
+                "random_seed should either succeed or report unsupported optional symbol"
+            );
+        }
+
+        mlx_array_free(uniform).expect("free uniform");
+        mlx_array_free(normal).expect("free normal");
+        mlx_array_free(grad).expect("free grad");
+        mlx_optim_free(optim).expect("free optimizer");
+        mlx_array_free(mean).expect("free mean");
+        mlx_array_free(sum).expect("free sum");
+        mlx_array_free(mat).expect("free mat");
+        mlx_array_free(rhs).expect("free rhs");
+        mlx_array_free(reshaped).expect("free reshaped");
+        mlx_array_free(add).expect("free add");
+        mlx_array_free(full).expect("free full");
+        mlx_array_free(one).expect("free one");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_exec_nn_forward_path() {
+        if !require_mlx_runtime() {
+            return;
+        }
+
+        let input = mlx_array_ones(MlxDtype::F32, &[5, 4]).expect("input should succeed");
+        let layer = mlx_nn_linear(4, 3).expect("nn linear should succeed");
+        let output = mlx_nn_forward(&layer, &input).expect("nn forward should succeed");
+        assert_eq!(
+            mlx_array_shape(&output).expect("shape should succeed"),
+            vec![5, 3]
+        );
+        mlx_array_eval(&output).expect("nn output eval should succeed");
+
+        match mlx_nn_softmax(&output, 1) {
+            Ok(softmax) => {
+                assert_eq!(
+                    mlx_array_shape(&softmax).expect("shape should succeed"),
+                    vec![5, 3]
+                );
+                mlx_array_eval(&softmax).expect("softmax eval should succeed");
+                mlx_array_free(softmax).expect("free softmax");
+            }
+            Err(err) => {
+                assert_eq!(
+                    err.kind, 7,
+                    "nn_softmax should either succeed or report unsupported optional symbol"
+                );
+            }
+        }
+
+        mlx_array_free(output).expect("free output");
+        mlx_nn_free(layer).expect("free layer");
+        mlx_array_free(input).expect("free input");
     }
 }
