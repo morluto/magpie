@@ -824,8 +824,16 @@ impl<'a> FnBuilder<'a> {
                     },
                 );
             }
-            MpirOp::Move { v }
-            | MpirOp::BorrowShared { v }
+            MpirOp::Move { v } => {
+                self.assign_or_copy_value(i.dst, i.ty, v)?;
+                if let MpirValue::Local(id) = v {
+                    // Move transfers ownership metadata; keep it on destination only.
+                    if id.0 != i.dst.0 {
+                        self.json_decode_owned.remove(&id.0);
+                    }
+                }
+            }
+            MpirOp::BorrowShared { v }
             | MpirOp::BorrowMut { v }
             | MpirOp::Share { v }
             | MpirOp::CloneShared { v }
@@ -6054,6 +6062,128 @@ mod tests {
         assert_eq!(
             decoded_free_calls, 1,
             "decode ownership metadata must be cleared after value ArcRelease to avoid double free"
+        );
+    }
+
+    #[test]
+    fn test_codegen_move_transfers_decode_ownership_metadata() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONMOVEO".to_string()),
+            path: "json_move_ownership.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONMOVEO".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: decode_result_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: decode_result_ty,
+                            op: MpirOp::Move {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(5),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        5,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "r_src".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: decode_result_ty,
+                        name: "r_moved".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: decode_result_ty,
+                        name: "released_moved".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: decode_result_ty,
+                        name: "released_src".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "Move should transfer decode ownership metadata to destination to avoid duplicate frees"
         );
     }
 
