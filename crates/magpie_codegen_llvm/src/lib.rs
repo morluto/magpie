@@ -733,8 +733,8 @@ struct FnBuilder<'a> {
     locals: HashMap<u32, Operand>,
     local_tys: HashMap<u32, TypeId>,
     json_decode_owned: HashMap<u32, DecodeOwnedTypeId>,
+    decode_consumed_slot_by_local: HashMap<u32, String>,
     known_result_err_null_ok: HashSet<u32>,
-    decode_may_consumed_in_by_block: HashMap<u32, HashSet<u32>>,
     decode_may_consumed_out_by_block: HashMap<u32, HashSet<u32>>,
 }
 
@@ -782,8 +782,7 @@ impl<'a> FnBuilder<'a> {
             );
         }
 
-        let (decode_may_consumed_in_by_block, decode_may_consumed_out_by_block) =
-            Self::compute_decode_consumed_flow(f);
+        let decode_may_consumed_out_by_block = Self::compute_decode_may_consumed_out_by_block(f);
 
         Ok(Self {
             cg,
@@ -794,8 +793,8 @@ impl<'a> FnBuilder<'a> {
             locals,
             local_tys,
             json_decode_owned: HashMap::new(),
+            decode_consumed_slot_by_local: HashMap::new(),
             known_result_err_null_ok: HashSet::new(),
-            decode_may_consumed_in_by_block,
             decode_may_consumed_out_by_block,
         })
     }
@@ -822,11 +821,7 @@ impl<'a> FnBuilder<'a> {
     }
 
     fn codegen_block(&mut self, b: &MpirBlock) -> Result<(), String> {
-        self.decode_consumed_current_block = self
-            .decode_may_consumed_in_by_block
-            .get(&b.id.0)
-            .cloned()
-            .unwrap_or_default();
+        self.decode_consumed_current_block.clear();
         writeln!(self.out, "bb{}:", b.id.0).map_err(|e| e.to_string())?;
         for i in &b.instrs {
             self.codegen_instr(i)?;
@@ -839,9 +834,7 @@ impl<'a> FnBuilder<'a> {
         out
     }
 
-    fn compute_decode_consumed_flow(
-        f: &MpirFn,
-    ) -> (HashMap<u32, HashSet<u32>>, HashMap<u32, HashSet<u32>>) {
+    fn compute_decode_may_consumed_out_by_block(f: &MpirFn) -> HashMap<u32, HashSet<u32>> {
         let mut consumed_gen_by_block = HashMap::new();
         let mut preds_by_block: HashMap<u32, Vec<u32>> = HashMap::new();
         for block in &f.blocks {
@@ -935,11 +928,92 @@ impl<'a> FnBuilder<'a> {
             }
         }
 
-        (may_in_by_block, may_out_by_block)
+        may_out_by_block
     }
 
-    fn mark_decode_consumed(&mut self, id: u32) {
+    fn mark_decode_consumed(&mut self, id: u32) -> Result<(), String> {
         self.decode_consumed_current_block.insert(id);
+        if let Some(slot) = self.decode_consumed_slot_by_local.get(&id).cloned() {
+            writeln!(self.out, "  store i1 1, ptr {slot}").map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn ensure_decode_consumed_slot(&mut self, id: u32) -> Result<String, String> {
+        if let Some(slot) = self.decode_consumed_slot_by_local.get(&id).cloned() {
+            return Ok(slot);
+        }
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca i1").map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store i1 0, ptr {slot}").map_err(|e| e.to_string())?;
+        self.decode_consumed_slot_by_local.insert(id, slot.clone());
+        Ok(slot)
+    }
+
+    fn init_decode_consumed_slot(&mut self, id: u32, consumed: bool) -> Result<(), String> {
+        let slot = self.ensure_decode_consumed_slot(id)?;
+        let bit = if consumed { "1" } else { "0" };
+        writeln!(self.out, "  store i1 {bit}, ptr {slot}").map_err(|e| e.to_string())
+    }
+
+    fn copy_decode_consumed_slot(&mut self, dst: u32, src: u32) -> Result<(), String> {
+        let dst_slot = self.ensure_decode_consumed_slot(dst)?;
+        if let Some(src_slot) = self.decode_consumed_slot_by_local.get(&src).cloned() {
+            let consumed = self.tmp();
+            writeln!(self.out, "  {consumed} = load i1, ptr {src_slot}")
+                .map_err(|e| e.to_string())?;
+            writeln!(self.out, "  store i1 {consumed}, ptr {dst_slot}")
+                .map_err(|e| e.to_string())?;
+        } else {
+            writeln!(self.out, "  store i1 0, ptr {dst_slot}").map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn emit_json_decoded_free_call(
+        &mut self,
+        p: &str,
+        type_id: &str,
+        decode_consumed_slot: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(slot) = decode_consumed_slot {
+            let consumed = self.tmp();
+            writeln!(self.out, "  {consumed} = load i1, ptr {slot}").map_err(|e| e.to_string())?;
+            let guarded_p = self.tmp();
+            writeln!(
+                self.out,
+                "  {guarded_p} = select i1 {consumed}, ptr null, ptr {p}"
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  call i32 @mp_rt_json_decoded_free(ptr {guarded_p}, i32 {type_id})"
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(self.out, "  store i1 1, ptr {slot}").map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        writeln!(
+            self.out,
+            "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn clear_decode_ownership_on_alias_copy(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        src: &MpirValue,
+        decode_owned: &Option<DecodeOwnedTypeId>,
+    ) {
+        if let (Some(_), MpirValue::Local(src_id)) = (decode_owned, src) {
+            if src_id.0 != dst_id.0 {
+                // json.decode ownership cannot be duplicated by aliasing/copy-like ops:
+                // decoded payload has no refcount increment primitive.
+                // Keep ownership on source and make destination a non-owning alias.
+                self.json_decode_owned.remove(&dst_id.0);
+            }
+        }
     }
 
     fn decode_owned_for_local_in_current_path(&self, id: u32) -> Option<DecodeOwnedTypeId> {
@@ -985,7 +1059,7 @@ impl<'a> FnBuilder<'a> {
                 if let MpirValue::Local(id) = v {
                     // Move consumes source ownership in this block path only.
                     if id.0 != i.dst.0 {
-                        self.mark_decode_consumed(id.0);
+                        self.mark_decode_consumed(id.0)?;
                     }
                 }
             }
@@ -996,7 +1070,12 @@ impl<'a> FnBuilder<'a> {
             | MpirOp::CloneWeak { v }
             | MpirOp::WeakDowngrade { v }
             | MpirOp::WeakUpgrade { v } => {
+                let decoded_ty = match v {
+                    MpirValue::Local(id) => self.decode_owned_for_local_in_current_path(id.0),
+                    _ => None,
+                };
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
+                self.clear_decode_ownership_on_alias_copy(i.dst, v, &decoded_ty);
             }
             MpirOp::New { ty, fields } => {
                 self.emit_new_struct(i.dst, i.ty, *ty, fields)?;
@@ -1268,8 +1347,10 @@ impl<'a> FnBuilder<'a> {
                                 .map_err(|e| e.to_string())?;
                             self.json_decode_owned
                                 .insert(i.dst.0, DecodeOwnedTypeId::Dynamic(dyn_tid));
+                            self.init_decode_consumed_slot(i.dst.0, false)?;
                         } else {
                             self.json_decode_owned.insert(i.dst.0, tid);
+                            self.init_decode_consumed_slot(i.dst.0, false)?;
                         }
                     }
                 }
@@ -1301,7 +1382,7 @@ impl<'a> FnBuilder<'a> {
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::RetainStrong, decoded_ty.clone())?;
+                    self.emit_arc_action(&op, ArcAction::RetainStrong, decoded_ty.clone(), None)?;
                 } else {
                     if decoded_ty.is_none() {
                         let p = self.ensure_ptr(op)?;
@@ -1310,14 +1391,7 @@ impl<'a> FnBuilder<'a> {
                     }
                 }
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
-                if let (Some(_), MpirValue::Local(src_id)) = (&decoded_ty, v) {
-                    if src_id.0 != i.dst.0 {
-                        // json.decode ownership cannot be duplicated by retain:
-                        // decoded payload has no refcount increment primitive.
-                        // Keep ownership on source and make retained dst a non-owning alias.
-                        self.json_decode_owned.remove(&i.dst.0);
-                    }
-                }
+                self.clear_decode_ownership_on_alias_copy(i.dst, v, &decoded_ty);
             }
             MpirOp::ArcRelease { v } => {
                 let op = self.value(v)?;
@@ -1325,17 +1399,22 @@ impl<'a> FnBuilder<'a> {
                     MpirValue::Local(id) => self.decode_owned_for_local_in_current_path(id.0),
                     _ => None,
                 };
+                let decoded_slot = match v {
+                    MpirValue::Local(id) => self.decode_consumed_slot_by_local.get(&id.0).cloned(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::ReleaseStrong, decoded_ty)?;
+                    self.emit_arc_action(
+                        &op,
+                        ArcAction::ReleaseStrong,
+                        decoded_ty,
+                        decoded_slot.as_deref(),
+                    )?;
                 } else {
                     if let Some(type_id) = decoded_ty {
                         let p = self.ensure_ptr(op)?;
                         let type_id = type_id.as_i32_operand();
-                        writeln!(
-                            self.out,
-                            "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
-                        )
-                        .map_err(|e| e.to_string())?;
+                        self.emit_json_decoded_free_call(&p, &type_id, decoded_slot.as_deref())?;
                     } else {
                         let p = self.ensure_ptr(op)?;
                         writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
@@ -1344,7 +1423,7 @@ impl<'a> FnBuilder<'a> {
                 }
                 self.set_default(i.dst, i.ty)?;
                 if let MpirValue::Local(id) = v {
-                    self.mark_decode_consumed(id.0);
+                    self.mark_decode_consumed(id.0)?;
                 }
             }
             MpirOp::ArcRetainWeak { v } => {
@@ -1354,7 +1433,7 @@ impl<'a> FnBuilder<'a> {
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::RetainWeak, decoded_ty)?;
+                    self.emit_arc_action(&op, ArcAction::RetainWeak, decoded_ty.clone(), None)?;
                 } else {
                     if decoded_ty.is_none() {
                         let p = self.ensure_ptr(op)?;
@@ -1363,6 +1442,7 @@ impl<'a> FnBuilder<'a> {
                     }
                 }
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
+                self.clear_decode_ownership_on_alias_copy(i.dst, v, &decoded_ty);
             }
             MpirOp::ArcReleaseWeak { v } => {
                 let op = self.value(v)?;
@@ -1371,7 +1451,7 @@ impl<'a> FnBuilder<'a> {
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::ReleaseWeak, decoded_ty)?;
+                    self.emit_arc_action(&op, ArcAction::ReleaseWeak, decoded_ty, None)?;
                 } else {
                     if decoded_ty.is_none() {
                         let p = self.ensure_ptr(op)?;
@@ -2073,6 +2153,7 @@ impl<'a> FnBuilder<'a> {
                     self.assign_gpu_launch_result(i.dst, i.ty, status, Some(decoded), err)?;
                     self.json_decode_owned
                         .insert(i.dst.0, DecodeOwnedTypeId::Const(ty.0));
+                    self.init_decode_consumed_slot(i.dst.0, false)?;
                 } else {
                     let ok = self.tmp();
                     writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
@@ -2098,6 +2179,7 @@ impl<'a> FnBuilder<'a> {
                     self.set_local(i.dst, i.ty, dst_ty, decoded);
                     self.json_decode_owned
                         .insert(i.dst.0, DecodeOwnedTypeId::Const(ty.0));
+                    self.init_decode_consumed_slot(i.dst.0, false)?;
                 }
             }
             MpirOp::GpuThreadId { dim }
@@ -2344,7 +2426,7 @@ impl<'a> FnBuilder<'a> {
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::RetainStrong, decoded_ty)?;
+                    self.emit_arc_action(&op, ArcAction::RetainStrong, decoded_ty, None)?;
                 } else {
                     if decoded_ty.is_none() {
                         let p = self.ensure_ptr(op)?;
@@ -2359,17 +2441,22 @@ impl<'a> FnBuilder<'a> {
                     MpirValue::Local(id) => self.decode_owned_for_local_in_current_path(id.0),
                     _ => None,
                 };
+                let decoded_slot = match v {
+                    MpirValue::Local(id) => self.decode_consumed_slot_by_local.get(&id.0).cloned(),
+                    _ => None,
+                };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::ReleaseStrong, decoded_ty)?;
+                    self.emit_arc_action(
+                        &op,
+                        ArcAction::ReleaseStrong,
+                        decoded_ty,
+                        decoded_slot.as_deref(),
+                    )?;
                 } else {
                     if let Some(type_id) = decoded_ty {
                         let p = self.ensure_ptr(op)?;
                         let type_id = type_id.as_i32_operand();
-                        writeln!(
-                            self.out,
-                            "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
-                        )
-                        .map_err(|e| e.to_string())?;
+                        self.emit_json_decoded_free_call(&p, &type_id, decoded_slot.as_deref())?;
                     } else {
                         let p = self.ensure_ptr(op)?;
                         writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
@@ -2377,7 +2464,7 @@ impl<'a> FnBuilder<'a> {
                     }
                 }
                 if let MpirValue::Local(id) = v {
-                    self.mark_decode_consumed(id.0);
+                    self.mark_decode_consumed(id.0)?;
                 }
             }
             MpirOpVoid::ArcRetainWeak { v } => {
@@ -2387,7 +2474,7 @@ impl<'a> FnBuilder<'a> {
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::RetainWeak, decoded_ty)?;
+                    self.emit_arc_action(&op, ArcAction::RetainWeak, decoded_ty, None)?;
                 } else {
                     if decoded_ty.is_none() {
                         let p = self.ensure_ptr(op)?;
@@ -2403,7 +2490,7 @@ impl<'a> FnBuilder<'a> {
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
-                    self.emit_arc_action(&op, ArcAction::ReleaseWeak, decoded_ty)?;
+                    self.emit_arc_action(&op, ArcAction::ReleaseWeak, decoded_ty, None)?;
                 } else {
                     if decoded_ty.is_none() {
                         let p = self.ensure_ptr(op)?;
@@ -4133,6 +4220,7 @@ impl<'a> FnBuilder<'a> {
             MpirValue::Local(src_id) => {
                 if let Some(type_id) = self.decode_owned_for_local_in_current_path(src_id.0) {
                     self.json_decode_owned.insert(dst_id.0, type_id);
+                    self.copy_decode_consumed_slot(dst_id.0, src_id.0)?;
                 }
                 if self.known_result_err_null_ok.contains(&src_id.0) {
                     self.known_result_err_null_ok.insert(dst_id.0);
@@ -4483,6 +4571,7 @@ impl<'a> FnBuilder<'a> {
         op: &Operand,
         action: ArcAction,
         decode_owned_type: Option<DecodeOwnedTypeId>,
+        decode_consumed_slot: Option<&str>,
     ) -> Result<(), String> {
         match self.cg.kind_of(op.ty_id) {
             Some(TypeKind::HeapHandle {
@@ -4510,7 +4599,7 @@ impl<'a> FnBuilder<'a> {
             Some(TypeKind::BuiltinOption { inner }) => {
                 let inner_op =
                     self.extract_aggregate_field(op, 0, *inner, self.cg.llvm_storage_ty(*inner))?;
-                self.emit_arc_action(&inner_op, action, None)?;
+                self.emit_arc_action(&inner_op, action, None, None)?;
             }
             Some(TypeKind::BuiltinResult { ok, err }) => {
                 let ok_is_rawptr = matches!(self.cg.kind_of(*ok), Some(TypeKind::RawPtr { .. }));
@@ -4524,26 +4613,22 @@ impl<'a> FnBuilder<'a> {
                         )
                         .map_err(|e| e.to_string())?;
                         let type_id = type_id.as_i32_operand();
-                        writeln!(
-                            self.out,
-                            "  call i32 @mp_rt_json_decoded_free(ptr {ok_ptr}, i32 {type_id})"
-                        )
-                        .map_err(|e| e.to_string())?;
+                        self.emit_json_decoded_free_call(&ok_ptr, &type_id, decode_consumed_slot)?;
                     }
                 } else {
                     let ok_op =
                         self.extract_aggregate_field(op, 1, *ok, self.cg.llvm_storage_ty(*ok))?;
-                    self.emit_arc_action(&ok_op, action, None)?;
+                    self.emit_arc_action(&ok_op, action, None, None)?;
                 }
                 let err_op =
                     self.extract_aggregate_field(op, 2, *err, self.cg.llvm_storage_ty(*err))?;
-                self.emit_arc_action(&err_op, action, None)?;
+                self.emit_arc_action(&err_op, action, None, None)?;
             }
             Some(TypeKind::Tuple { elems }) => {
                 for (idx, elem) in elems.iter().enumerate() {
                     let field =
                         self.extract_aggregate_field(op, idx, *elem, self.cg.llvm_ty(*elem))?;
-                    self.emit_arc_action(&field, action, None)?;
+                    self.emit_arc_action(&field, action, None, None)?;
                 }
             }
             Some(TypeKind::Prim(_))
@@ -6531,6 +6616,250 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_clone_shared_does_not_duplicate_decode_ownership_metadata() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONCLNO0".to_string()),
+            path: "json_clone_shared_ownership.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONCLNO0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: decode_result_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: decode_result_ty,
+                            op: MpirOp::CloneShared {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(5),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        5,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "json".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "decoded".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: decode_result_ty,
+                        name: "cloned".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: decode_result_ty,
+                        name: "released_src".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: decode_result_ty,
+                        name: "released_dst".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "CloneShared must not duplicate json.decode ownership metadata across locals"
+        );
+    }
+
+    #[test]
+    fn test_codegen_arc_retain_weak_does_not_duplicate_decode_ownership_metadata() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONRWK0".to_string()),
+            path: "json_retain_weak_ownership.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONRWK0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: decode_result_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRetainWeak {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(5),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        5,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "json".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "decoded".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: decode_result_ty,
+                        name: "retained_weak".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: decode_result_ty,
+                        name: "released_src".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: decode_result_ty,
+                        name: "released_dst".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "ArcRetainWeak must not duplicate json.decode ownership metadata across locals"
+        );
+    }
+
+    #[test]
     fn test_codegen_phi_preserves_decode_ownership_with_mixed_incomings() {
         let mut type_ctx = TypeCtx::new();
         let str_ty = fixed_type_ids::STR;
@@ -7064,8 +7393,12 @@ mod tests {
         let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
         let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
         assert_eq!(
-            decoded_free_calls, 1,
-            "non-phi join must treat predecessor-consumed decode ownership as consumed to avoid double free"
+            decoded_free_calls, 2,
+            "non-phi join should still emit both release sites; runtime consumed flag guard prevents double free"
+        );
+        assert!(
+            llvm_ir.contains("select i1") && llvm_ir.contains("store i1 1, ptr"),
+            "expected runtime decode-consumed guard around non-phi join release"
         );
     }
 
