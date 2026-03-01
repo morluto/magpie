@@ -709,6 +709,21 @@ enum ArcAction {
     ReleaseWeak,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DecodeOwnedTypeId {
+    Const(u32),
+    Dynamic(String),
+}
+
+impl DecodeOwnedTypeId {
+    fn as_i32_operand(&self) -> String {
+        match self {
+            Self::Const(v) => v.to_string(),
+            Self::Dynamic(v) => v.clone(),
+        }
+    }
+}
+
 struct FnBuilder<'a> {
     cg: &'a LlvmTextCodegen<'a>,
     f: &'a MpirFn,
@@ -716,7 +731,7 @@ struct FnBuilder<'a> {
     tmp_idx: u32,
     locals: HashMap<u32, Operand>,
     local_tys: HashMap<u32, TypeId>,
-    json_decode_owned: HashMap<u32, u32>,
+    json_decode_owned: HashMap<u32, DecodeOwnedTypeId>,
     known_result_err_null_ok: HashSet<u32>,
 }
 
@@ -1055,24 +1070,30 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::Phi { incomings, .. } => {
                 let mut parts = Vec::with_capacity(incomings.len());
-                let mut phi_decode_owned: Option<u32> = None;
+                let mut phi_decode_owned: Option<DecodeOwnedTypeId> = None;
                 let mut phi_decode_conflict = false;
                 let mut phi_decode_incompatible = false;
                 let mut phi_all_known_err_null_ok = true;
+                let mut decode_incomings = Vec::with_capacity(incomings.len());
                 for (bb, v) in incomings {
                     let op = self.value(v)?;
                     parts.push(format!("[ {}, %bb{} ]", op.repr, bb.0));
                     let incoming_decode = match v {
-                        MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                        MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                         _ => None,
                     };
                     let incoming_known_err_null_ok = match v {
                         MpirValue::Local(id) => self.known_result_err_null_ok.contains(&id.0),
                         _ => false,
                     };
+                    decode_incomings.push((
+                        *bb,
+                        incoming_decode.clone(),
+                        incoming_known_err_null_ok,
+                    ));
                     if let Some(tid) = incoming_decode {
-                        if let Some(existing) = phi_decode_owned {
-                            if existing != tid {
+                        if let Some(existing) = &phi_decode_owned {
+                            if existing != &tid {
                                 phi_decode_conflict = true;
                             }
                         } else {
@@ -1090,9 +1111,27 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {dst} = phi {dst_ty} {}", parts.join(", "))
                     .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
-                if !phi_decode_conflict && !phi_decode_incompatible {
+                if !phi_decode_incompatible {
                     if let Some(tid) = phi_decode_owned {
-                        self.json_decode_owned.insert(i.dst.0, tid);
+                        if phi_decode_conflict {
+                            let fallback_tid = tid.as_i32_operand();
+                            let mut tid_parts = Vec::with_capacity(decode_incomings.len());
+                            for (bb, incoming_tid, incoming_known_err_null_ok) in decode_incomings {
+                                let incoming_tid = match incoming_tid {
+                                    Some(meta) => meta.as_i32_operand(),
+                                    None if incoming_known_err_null_ok => fallback_tid.clone(),
+                                    None => fallback_tid.clone(),
+                                };
+                                tid_parts.push(format!("[ {incoming_tid}, %bb{} ]", bb.0));
+                            }
+                            let dyn_tid = self.tmp();
+                            writeln!(self.out, "  {dyn_tid} = phi i32 {}", tid_parts.join(", "))
+                                .map_err(|e| e.to_string())?;
+                            self.json_decode_owned
+                                .insert(i.dst.0, DecodeOwnedTypeId::Dynamic(dyn_tid));
+                        } else {
+                            self.json_decode_owned.insert(i.dst.0, tid);
+                        }
                     }
                 }
                 if phi_all_known_err_null_ok {
@@ -1119,7 +1158,7 @@ impl<'a> FnBuilder<'a> {
             MpirOp::ArcRetain { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -1136,7 +1175,7 @@ impl<'a> FnBuilder<'a> {
             MpirOp::ArcRelease { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -1144,6 +1183,7 @@ impl<'a> FnBuilder<'a> {
                 } else {
                     if let Some(type_id) = decoded_ty {
                         let p = self.ensure_ptr(op)?;
+                        let type_id = type_id.as_i32_operand();
                         writeln!(
                             self.out,
                             "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
@@ -1163,7 +1203,7 @@ impl<'a> FnBuilder<'a> {
             MpirOp::ArcRetainWeak { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -1180,7 +1220,7 @@ impl<'a> FnBuilder<'a> {
             MpirOp::ArcReleaseWeak { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -1884,7 +1924,8 @@ impl<'a> FnBuilder<'a> {
                     writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
                         .map_err(|e| e.to_string())?;
                     self.assign_gpu_launch_result(i.dst, i.ty, status, Some(decoded), err)?;
-                    self.json_decode_owned.insert(i.dst.0, ty.0);
+                    self.json_decode_owned
+                        .insert(i.dst.0, DecodeOwnedTypeId::Const(ty.0));
                 } else {
                     let ok = self.tmp();
                     writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
@@ -1908,7 +1949,8 @@ impl<'a> FnBuilder<'a> {
                     writeln!(self.out, "  {decoded} = load ptr, ptr {out_slot}")
                         .map_err(|e| e.to_string())?;
                     self.set_local(i.dst, i.ty, dst_ty, decoded);
-                    self.json_decode_owned.insert(i.dst.0, ty.0);
+                    self.json_decode_owned
+                        .insert(i.dst.0, DecodeOwnedTypeId::Const(ty.0));
                 }
             }
             MpirOp::GpuThreadId { dim }
@@ -2151,7 +2193,7 @@ impl<'a> FnBuilder<'a> {
             MpirOpVoid::ArcRetain { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -2167,7 +2209,7 @@ impl<'a> FnBuilder<'a> {
             MpirOpVoid::ArcRelease { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -2175,6 +2217,7 @@ impl<'a> FnBuilder<'a> {
                 } else {
                     if let Some(type_id) = decoded_ty {
                         let p = self.ensure_ptr(op)?;
+                        let type_id = type_id.as_i32_operand();
                         writeln!(
                             self.out,
                             "  call i32 @mp_rt_json_decoded_free(ptr {p}, i32 {type_id})"
@@ -2193,7 +2236,7 @@ impl<'a> FnBuilder<'a> {
             MpirOpVoid::ArcRetainWeak { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -2209,7 +2252,7 @@ impl<'a> FnBuilder<'a> {
             MpirOpVoid::ArcReleaseWeak { v } => {
                 let op = self.value(v)?;
                 let decoded_ty = match v {
-                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
+                    MpirValue::Local(id) => self.json_decode_owned.get(&id.0).cloned(),
                     _ => None,
                 };
                 if op.ty.starts_with('{') {
@@ -3941,7 +3984,7 @@ impl<'a> FnBuilder<'a> {
         self.assign_or_copy(dst_id, dst_ty, src)?;
         match v {
             MpirValue::Local(src_id) => {
-                if let Some(type_id) = self.json_decode_owned.get(&src_id.0).copied() {
+                if let Some(type_id) = self.json_decode_owned.get(&src_id.0).cloned() {
                     self.json_decode_owned.insert(dst_id.0, type_id);
                 }
                 if self.known_result_err_null_ok.contains(&src_id.0) {
@@ -4292,7 +4335,7 @@ impl<'a> FnBuilder<'a> {
         &mut self,
         op: &Operand,
         action: ArcAction,
-        decode_owned_type: Option<u32>,
+        decode_owned_type: Option<DecodeOwnedTypeId>,
     ) -> Result<(), String> {
         match self.cg.kind_of(op.ty_id) {
             Some(TypeKind::HeapHandle {
@@ -4333,6 +4376,7 @@ impl<'a> FnBuilder<'a> {
                             op.ty, op.repr
                         )
                         .map_err(|e| e.to_string())?;
+                        let type_id = type_id.as_i32_operand();
                         writeln!(
                             self.out,
                             "  call i32 @mp_rt_json_decoded_free(ptr {ok_ptr}, i32 {type_id})"
@@ -6590,6 +6634,201 @@ mod tests {
         assert_eq!(
             decoded_free_calls, 0,
             "phi must not propagate decode ownership when one incoming is an arbitrary Ok(rawptr)"
+        );
+    }
+
+    #[test]
+    fn test_codegen_phi_with_conflicting_decode_types_uses_dynamic_type_id_free() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let bool_ty = fixed_type_ids::BOOL;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONPHITID".to_string()),
+            path: "json_phi_typeid.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONPHITID".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![
+                    MpirBlock {
+                        id: magpie_types::BlockId(0),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(0),
+                                ty: str_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: str_ty,
+                                    lit: HirConstLit::StringLit("42".to_string()),
+                                }),
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(1),
+                                ty: str_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: str_ty,
+                                    lit: HirConstLit::StringLit("7".to_string()),
+                                }),
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(2),
+                                ty: decode_result_ty,
+                                op: MpirOp::JsonDecode {
+                                    ty: fixed_type_ids::I32,
+                                    s: MpirValue::Local(magpie_types::LocalId(0)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(3),
+                                ty: decode_result_ty,
+                                op: MpirOp::JsonDecode {
+                                    ty: fixed_type_ids::I64,
+                                    s: MpirValue::Local(magpie_types::LocalId(1)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(4),
+                                ty: bool_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: bool_ty,
+                                    lit: HirConstLit::BoolLit(true),
+                                }),
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Cbr {
+                            cond: MpirValue::Local(magpie_types::LocalId(4)),
+                            then_bb: magpie_types::BlockId(1),
+                            else_bb: magpie_types::BlockId(2),
+                        },
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(1),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Br(magpie_types::BlockId(3)),
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(2),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Br(magpie_types::BlockId(3)),
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(3),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(5),
+                                ty: decode_result_ty,
+                                op: MpirOp::Phi {
+                                    ty: decode_result_ty,
+                                    incomings: vec![
+                                        (
+                                            magpie_types::BlockId(1),
+                                            MpirValue::Local(magpie_types::LocalId(2)),
+                                        ),
+                                        (
+                                            magpie_types::BlockId(2),
+                                            MpirValue::Local(magpie_types::LocalId(3)),
+                                        ),
+                                    ],
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(6),
+                                ty: decode_result_ty,
+                                op: MpirOp::ArcRelease {
+                                    v: MpirValue::Local(magpie_types::LocalId(5)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(7),
+                                ty: i32_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: i32_ty,
+                                    lit: HirConstLit::IntLit(0),
+                                }),
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Ret(Some(MpirValue::Local(
+                            magpie_types::LocalId(7),
+                        ))),
+                    },
+                ],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "json_i32".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: str_ty,
+                        name: "json_i64".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: decode_result_ty,
+                        name: "decoded_i32".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: decode_result_ty,
+                        name: "decoded_i64".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: bool_ty,
+                        name: "cond".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: decode_result_ty,
+                        name: "merged".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(6),
+                        ty: decode_result_ty,
+                        name: "released".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(7),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("phi { i1, ptr, ptr }"));
+        assert!(
+            llvm_ir.contains("phi i32"),
+            "expected dynamic decode type-id phi"
+        );
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "conflicting decode type-id phi should still free decoded payload using dynamic type-id"
+        );
+        assert!(
+            llvm_ir.contains("call i32 @mp_rt_json_decoded_free(ptr")
+                && llvm_ir.contains(", i32 %"),
+            "decode free should be emitted with dynamic i32 type-id value"
         );
     }
 
