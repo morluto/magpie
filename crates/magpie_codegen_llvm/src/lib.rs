@@ -1125,6 +1125,9 @@ impl<'a> FnBuilder<'a> {
                     }
                 }
                 self.set_default(i.dst, i.ty)?;
+                if let MpirValue::Local(id) = v {
+                    self.json_decode_owned.remove(&id.0);
+                }
             }
             MpirOp::ArcRetainWeak { v } => {
                 let op = self.value(v)?;
@@ -5941,6 +5944,116 @@ mod tests {
         assert!(
             !llvm_ir.contains("extractvalue { i1, ptr, ptr } %l1, 1\n  call void @mp_rt_release_strong"),
             "rawptr payload in TResult<rawptr<u8>, Str> must not be retained/released as heap handle"
+        );
+    }
+
+    #[test]
+    fn test_codegen_value_arc_release_clears_decode_ownership_metadata() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONARC2X".to_string()),
+            path: "json_arc_release_twice.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONARC2X".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: decode_result_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        4,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "r".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: decode_result_ty,
+                        name: "released_0".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: decode_result_ty,
+                        name: "released_1".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "decode ownership metadata must be cleared after value ArcRelease to avoid double free"
         );
     }
 
