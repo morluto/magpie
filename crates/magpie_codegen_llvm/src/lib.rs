@@ -1054,7 +1054,7 @@ impl<'a> FnBuilder<'a> {
             MpirOp::Phi { incomings, .. } => {
                 let mut parts = Vec::with_capacity(incomings.len());
                 let mut phi_decode_owned: Option<u32> = None;
-                let mut phi_decode_consistent = true;
+                let mut phi_decode_conflict = false;
                 for (bb, v) in incomings {
                     let op = self.value(v)?;
                     parts.push(format!("[ {}, %bb{} ]", op.repr, bb.0));
@@ -1062,20 +1062,20 @@ impl<'a> FnBuilder<'a> {
                         MpirValue::Local(id) => self.json_decode_owned.get(&id.0).copied(),
                         _ => None,
                     };
-                    if let Some(existing) = phi_decode_owned {
-                        if incoming_decode != Some(existing) {
-                            phi_decode_consistent = false;
+                    if let Some(tid) = incoming_decode {
+                        if let Some(existing) = phi_decode_owned {
+                            if existing != tid {
+                                phi_decode_conflict = true;
+                            }
+                        } else {
+                            phi_decode_owned = Some(tid);
                         }
-                    } else if let Some(tid) = incoming_decode {
-                        phi_decode_owned = Some(tid);
-                    } else {
-                        phi_decode_consistent = false;
                     }
                 }
                 writeln!(self.out, "  {dst} = phi {dst_ty} {}", parts.join(", "))
                     .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
-                if phi_decode_consistent {
+                if !phi_decode_conflict {
                     if let Some(tid) = phi_decode_owned {
                         self.json_decode_owned.insert(i.dst.0, tid);
                     }
@@ -6184,6 +6184,196 @@ mod tests {
         assert_eq!(
             decoded_free_calls, 1,
             "Move should transfer decode ownership metadata to destination to avoid duplicate frees"
+        );
+    }
+
+    #[test]
+    fn test_codegen_phi_preserves_decode_ownership_with_mixed_incomings() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let bool_ty = fixed_type_ids::BOOL;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONPHI000".to_string()),
+            path: "json_phi_mixed.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONPHI000".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![
+                    MpirBlock {
+                        id: magpie_types::BlockId(0),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(0),
+                                ty: str_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: str_ty,
+                                    lit: HirConstLit::StringLit("42".to_string()),
+                                }),
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(1),
+                                ty: decode_result_ty,
+                                op: MpirOp::JsonDecode {
+                                    ty: fixed_type_ids::I32,
+                                    s: MpirValue::Local(magpie_types::LocalId(0)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(2),
+                                ty: bool_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: bool_ty,
+                                    lit: HirConstLit::BoolLit(true),
+                                }),
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Cbr {
+                            cond: MpirValue::Local(magpie_types::LocalId(2)),
+                            then_bb: magpie_types::BlockId(1),
+                            else_bb: magpie_types::BlockId(2),
+                        },
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(1),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Br(magpie_types::BlockId(3)),
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(2),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(3),
+                                ty: str_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: str_ty,
+                                    lit: HirConstLit::StringLit("oops".to_string()),
+                                }),
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(4),
+                                ty: decode_result_ty,
+                                op: MpirOp::EnumNew {
+                                    variant: "Err".to_string(),
+                                    args: vec![(
+                                        "e".to_string(),
+                                        MpirValue::Local(magpie_types::LocalId(3)),
+                                    )],
+                                },
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Br(magpie_types::BlockId(3)),
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(3),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(5),
+                                ty: decode_result_ty,
+                                op: MpirOp::Phi {
+                                    ty: decode_result_ty,
+                                    incomings: vec![
+                                        (
+                                            magpie_types::BlockId(1),
+                                            MpirValue::Local(magpie_types::LocalId(1)),
+                                        ),
+                                        (
+                                            magpie_types::BlockId(2),
+                                            MpirValue::Local(magpie_types::LocalId(4)),
+                                        ),
+                                    ],
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(6),
+                                ty: decode_result_ty,
+                                op: MpirOp::ArcRelease {
+                                    v: MpirValue::Local(magpie_types::LocalId(5)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(7),
+                                ty: i32_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: i32_ty,
+                                    lit: HirConstLit::IntLit(0),
+                                }),
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Ret(Some(MpirValue::Local(
+                            magpie_types::LocalId(7),
+                        ))),
+                    },
+                ],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "json".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "decoded".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: bool_ty,
+                        name: "cond".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: str_ty,
+                        name: "errmsg".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: decode_result_ty,
+                        name: "err_result".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: decode_result_ty,
+                        name: "merged".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(6),
+                        ty: decode_result_ty,
+                        name: "released".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(7),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("phi { i1, ptr, ptr }"));
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "mixed-source phi should preserve decode ownership metadata so decoded payloads are released"
         );
     }
 
