@@ -734,7 +734,8 @@ struct FnBuilder<'a> {
     local_tys: HashMap<u32, TypeId>,
     json_decode_owned: HashMap<u32, DecodeOwnedTypeId>,
     known_result_err_null_ok: HashSet<u32>,
-    decode_consumed_by_block: HashMap<u32, HashSet<u32>>,
+    decode_may_consumed_in_by_block: HashMap<u32, HashSet<u32>>,
+    decode_may_consumed_out_by_block: HashMap<u32, HashSet<u32>>,
 }
 
 impl<'a> FnBuilder<'a> {
@@ -781,6 +782,9 @@ impl<'a> FnBuilder<'a> {
             );
         }
 
+        let (decode_may_consumed_in_by_block, decode_may_consumed_out_by_block) =
+            Self::compute_decode_consumed_flow(f);
+
         Ok(Self {
             cg,
             f,
@@ -791,7 +795,8 @@ impl<'a> FnBuilder<'a> {
             local_tys,
             json_decode_owned: HashMap::new(),
             known_result_err_null_ok: HashSet::new(),
-            decode_consumed_by_block: Self::compute_decode_consumed_by_block(f),
+            decode_may_consumed_in_by_block,
+            decode_may_consumed_out_by_block,
         })
     }
 
@@ -817,7 +822,11 @@ impl<'a> FnBuilder<'a> {
     }
 
     fn codegen_block(&mut self, b: &MpirBlock) -> Result<(), String> {
-        self.decode_consumed_current_block.clear();
+        self.decode_consumed_current_block = self
+            .decode_may_consumed_in_by_block
+            .get(&b.id.0)
+            .cloned()
+            .unwrap_or_default();
         writeln!(self.out, "bb{}:", b.id.0).map_err(|e| e.to_string())?;
         for i in &b.instrs {
             self.codegen_instr(i)?;
@@ -830,10 +839,14 @@ impl<'a> FnBuilder<'a> {
         out
     }
 
-    fn compute_decode_consumed_by_block(f: &MpirFn) -> HashMap<u32, HashSet<u32>> {
-        let mut consumed_by_block = HashMap::new();
+    fn compute_decode_consumed_flow(
+        f: &MpirFn,
+    ) -> (HashMap<u32, HashSet<u32>>, HashMap<u32, HashSet<u32>>) {
+        let mut consumed_gen_by_block = HashMap::new();
+        let mut preds_by_block: HashMap<u32, Vec<u32>> = HashMap::new();
         for block in &f.blocks {
             let mut consumed = HashSet::new();
+            preds_by_block.entry(block.id.0).or_default();
             for instr in &block.instrs {
                 match &instr.op {
                     MpirOp::Move {
@@ -857,9 +870,72 @@ impl<'a> FnBuilder<'a> {
                     consumed.insert(id.0);
                 }
             }
-            consumed_by_block.insert(block.id.0, consumed);
+            consumed_gen_by_block.insert(block.id.0, consumed);
+            match &block.terminator {
+                MpirTerminator::Ret(_) | MpirTerminator::Unreachable => {}
+                MpirTerminator::Br(succ) => {
+                    preds_by_block.entry(succ.0).or_default().push(block.id.0);
+                }
+                MpirTerminator::Cbr {
+                    then_bb, else_bb, ..
+                } => {
+                    preds_by_block
+                        .entry(then_bb.0)
+                        .or_default()
+                        .push(block.id.0);
+                    preds_by_block
+                        .entry(else_bb.0)
+                        .or_default()
+                        .push(block.id.0);
+                }
+                MpirTerminator::Switch { arms, default, .. } => {
+                    for (_, succ) in arms {
+                        preds_by_block.entry(succ.0).or_default().push(block.id.0);
+                    }
+                    preds_by_block
+                        .entry(default.0)
+                        .or_default()
+                        .push(block.id.0);
+                }
+            }
         }
-        consumed_by_block
+
+        let mut may_in_by_block: HashMap<u32, HashSet<u32>> =
+            f.blocks.iter().map(|b| (b.id.0, HashSet::new())).collect();
+        let mut may_out_by_block: HashMap<u32, HashSet<u32>> = consumed_gen_by_block.clone();
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &f.blocks {
+                let bid = block.id.0;
+
+                let mut new_in = HashSet::new();
+                if let Some(preds) = preds_by_block.get(&bid) {
+                    for pred in preds {
+                        if let Some(pred_out) = may_out_by_block.get(pred) {
+                            new_in.extend(pred_out.iter().copied());
+                        }
+                    }
+                }
+
+                let mut new_out = new_in.clone();
+                if let Some(block_gen) = consumed_gen_by_block.get(&bid) {
+                    new_out.extend(block_gen.iter().copied());
+                }
+
+                if may_in_by_block.get(&bid) != Some(&new_in) {
+                    may_in_by_block.insert(bid, new_in);
+                    changed = true;
+                }
+                if may_out_by_block.get(&bid) != Some(&new_out) {
+                    may_out_by_block.insert(bid, new_out);
+                    changed = true;
+                }
+            }
+        }
+
+        (may_in_by_block, may_out_by_block)
     }
 
     fn mark_decode_consumed(&mut self, id: u32) {
@@ -876,7 +952,7 @@ impl<'a> FnBuilder<'a> {
 
     fn decode_owned_for_incoming_edge(&self, pred_bb: u32, id: u32) -> Option<DecodeOwnedTypeId> {
         if self
-            .decode_consumed_by_block
+            .decode_may_consumed_out_by_block
             .get(&pred_bb)
             .map_or(false, |ids| ids.contains(&id))
         {
@@ -6842,6 +6918,154 @@ mod tests {
         assert_eq!(
             decoded_free_calls, 2,
             "phi must preserve decode ownership on the non-consuming predecessor edge"
+        );
+    }
+
+    #[test]
+    fn test_codegen_non_phi_join_uses_predecessor_decode_consumption_state() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let bool_ty = fixed_type_ids::BOOL;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONJOIN0".to_string()),
+            path: "json_non_phi_join.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONJOIN0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![
+                    MpirBlock {
+                        id: magpie_types::BlockId(0),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(0),
+                                ty: str_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: str_ty,
+                                    lit: HirConstLit::StringLit("42".to_string()),
+                                }),
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(1),
+                                ty: decode_result_ty,
+                                op: MpirOp::JsonDecode {
+                                    ty: fixed_type_ids::I32,
+                                    s: MpirValue::Local(magpie_types::LocalId(0)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(2),
+                                ty: bool_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: bool_ty,
+                                    lit: HirConstLit::BoolLit(true),
+                                }),
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Cbr {
+                            cond: MpirValue::Local(magpie_types::LocalId(2)),
+                            then_bb: magpie_types::BlockId(1),
+                            else_bb: magpie_types::BlockId(2),
+                        },
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(1),
+                        instrs: vec![MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: decode_result_ty,
+                            op: MpirOp::ArcRelease {
+                                v: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        }],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Br(magpie_types::BlockId(3)),
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(2),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Br(magpie_types::BlockId(3)),
+                    },
+                    MpirBlock {
+                        id: magpie_types::BlockId(3),
+                        instrs: vec![
+                            MpirInstr {
+                                dst: magpie_types::LocalId(4),
+                                ty: decode_result_ty,
+                                op: MpirOp::ArcRelease {
+                                    v: MpirValue::Local(magpie_types::LocalId(1)),
+                                },
+                            },
+                            MpirInstr {
+                                dst: magpie_types::LocalId(5),
+                                ty: i32_ty,
+                                op: MpirOp::Const(HirConst {
+                                    ty: i32_ty,
+                                    lit: HirConstLit::IntLit(0),
+                                }),
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Ret(Some(MpirValue::Local(
+                            magpie_types::LocalId(5),
+                        ))),
+                    },
+                ],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "json".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "decoded".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: bool_ty,
+                        name: "cond".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: decode_result_ty,
+                        name: "released_in_then".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: decode_result_ty,
+                        name: "released_in_join".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+                gpu_meta: None,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        let decoded_free_calls = llvm_ir.matches("call i32 @mp_rt_json_decoded_free").count();
+        assert_eq!(
+            decoded_free_calls, 1,
+            "non-phi join must treat predecessor-consumed decode ownership as consumed to avoid double free"
         );
     }
 
